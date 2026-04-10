@@ -1,0 +1,12 @@
+demo_audit/
+demo_encryption/
+demo_key_rotation/
+demo_keys/
+demo_identity/
+src/__pycache__/
+tests/__pycache__/
+*.log
+*.tmp
+*.bak
+.venv/
+../Architect.pdf
