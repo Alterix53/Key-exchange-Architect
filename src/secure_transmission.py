@@ -5,7 +5,7 @@ Quản lý truyền dữ liệu an toàn sử dụng mã hóa
 
 import json
 import base64
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives import hashes, serialization, hmac
@@ -285,8 +285,8 @@ class SecureTransmissionChannel:
             print(f"Lỗi giải mã: {e}")
             return None
     
-    def get_message_log(self, sender_id: str = None, 
-                       recipient_id: str = None) -> list:
+    def get_message_log(self, sender_id: Optional[str] = None,
+                       recipient_id: Optional[str] = None) -> list:
         """Lấy nhật ký thông điệp"""
         logs = self.message_log
         

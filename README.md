@@ -80,6 +80,29 @@ Step 4: Explore Code
     src/secure_transmission.py  # Encryption
     src/audit_logging.py        # Audit trail
 
+Step 5: Run Terminal Relay Chat (2 clients)
+─────────────
+
+    Terminal 1:
+    python server.py --host 127.0.0.1 --port 5000
+
+    Terminal 2:
+    python client.py --name A --host 127.0.0.1 --port 5000
+
+    Terminal 3:
+    python client.py --name B --host 127.0.0.1 --port 5000
+
+    Required logs when sending from A to B:
+    - Client A
+      [STATUS] Đã nhận Certificate từ Server: {...}
+      [INPUT] Tin nhắn ban đầu: ...
+      [ENCRYPT] Tin nhắn sau khi mã hóa: ...
+    - Server
+      [LOG] Đang chuyển tiếp tin nhắn mã hóa từ Client A sang Client B.
+    - Client B
+      [RECEIVED] Tin nhắn mã hóa nhận được: ...
+      [DECRYPT] Tin nhắn sau khi giải mã: ...
+
 
 ============================================
 📂 PROJECT STRUCTURE

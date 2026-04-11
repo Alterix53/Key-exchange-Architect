@@ -232,6 +232,49 @@ Chạy test cụ thể:
 
 
 ================================================================================
+9. TERMINAL RELAY CHAT (SERVER + 2 CLIENT)
+================================================================================
+
+Luồng chạy:
+──────────
+
+1) Chạy server trước
+
+        python server.py --host 127.0.0.1 --port 5000
+
+2) Mở terminal thứ hai cho client A
+
+        python client.py --name A --host 127.0.0.1 --port 5000
+
+3) Mở terminal thứ ba cho client B
+
+        python client.py --name B --host 127.0.0.1 --port 5000
+
+4) Tại terminal client A nhập tin nhắn
+
+Kết quả cần thấy:
+───────────────
+
+- Client gửi
+    [STATUS] Đã nhận Certificate từ Server: {...}
+    [INPUT] Tin nhắn ban đầu: {nội dung gốc}
+    [ENCRYPT] Tin nhắn sau khi mã hóa: {nonce/ciphertext/tag dạng Base64}
+
+- Server
+    [LOG] Đang chuyển tiếp tin nhắn mã hóa từ Client A sang Client B.
+
+- Client nhận
+    [RECEIVED] Tin nhắn mã hóa nhận được: {nonce/ciphertext/tag dạng Base64}
+    [DECRYPT] Tin nhắn sau khi giải mã: {nội dung gốc}
+
+Ghi chú:
+────────
+
+- Server hiện chỉ hỗ trợ đúng 2 client kết nối cùng lúc.
+- Nhập "exit" hoặc "quit" ở client để thoát.
+
+
+================================================================================
 5. VÍ DỤ HOÀN CHỈNH
 ================================================================================
 
