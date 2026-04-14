@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from src.audit_logging import AuditEventType, AuditLogger
 from src.secure_transmission import SecureTransmissionChannel
+from src.public_key_distribution import CertificateAuthority
 
 
 def send_json(sock: socket.socket, payload: Dict) -> None:
@@ -48,48 +49,8 @@ class RelayServer:
         self.clients_lock = threading.Lock()
         self.shared_session_key: Optional[bytes] = None
 
-        self.ca_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        self.ca_public_key = self.ca_private_key.public_key()
-
-    def _public_key_pem(self) -> str:
-        return self.ca_public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        ).decode("utf-8")
-
-    def _build_certificate(self, client_id: str, client_public_pem: str) -> Dict:
-        issued_at = datetime.now()
-        cert_payload = {
-            "serial": base64.b16encode(hashlib.sha256(f"{client_id}:{issued_at.isoformat()}".encode("utf-8")).digest()[:8]).decode("ascii"),
-            "issuer": "IAM-Relay-Server-CA",
-            "subject": client_id,
-            "valid_from": issued_at.isoformat(),
-            "valid_to": (issued_at + timedelta(days=30)).isoformat(),
-            "server_public_key": self._public_key_pem(),
-            "client_public_key_fingerprint": hashlib.sha256(client_public_pem.encode("utf-8")).hexdigest(),
-        }
-        signing_input = json.dumps(cert_payload, sort_keys=True)
-        cert_signature = self.channel.sign_message(signing_input, self.ca_private_key)
-        cert_payload["signature"] = cert_signature
-        return cert_payload
-
-    def _try_share_session_key(self) -> None:
-        with self.clients_lock:
-            if len(self.clients) != 2 or self.shared_session_key is not None:
-                return
-
-            self.shared_session_key = base64.b64encode(os.urandom(32))
-            key_b64_text = self.shared_session_key.decode("utf-8")
-
-            for conn in self.clients.values():
-                encrypted_key = self.channel.encrypt_rsa_oaep(key_b64_text, conn.public_key)
-                conn.send(
-                    {
-                        "type": "session_key",
-                        "algorithm": "RSA-OAEP + AES-256-GCM",
-                        "encrypted_key": encrypted_key,
-                    }
-                )
+        # [MODIFIED] Sử dụng CertificateAuthority từ module public_key_distribution thay vì hardcode
+        self.ca = CertificateAuthority()
 
     def _relay_message(self, sender_id: str, message: Dict) -> None:
         with self.clients_lock:
@@ -158,9 +119,10 @@ class RelayServer:
                 conn = ClientConnection(client_id=client_id, sock=client_sock, file_reader=file_reader, public_key=public_key)
                 self.clients[client_id] = conn
 
-            cert = self._build_certificate(client_id, public_key_pem)
+            # [MODIFIED] Cấp phát chứng chỉ và lưu trong repository của CA (Bao gồm đồng bộ xuống Disk)
+            cert = self.ca.issue_certificate(client_id, public_key_pem)
             conn.send({"type": "cert", "certificate": cert})
-            print(f"[CERT] Certificate đã cấp cho {client_id}: {json.dumps(cert, indent=2, ensure_ascii=False)}")
+            print(f"[CERT] Certificate đã cấp cho {client_id}")
 
             self.audit.log_event(
                 AuditEventType.USER_LOGIN,
@@ -170,7 +132,12 @@ class RelayServer:
                 details={"ip": client_addr[0], "port": client_addr[1]},
             )
 
-            self._try_share_session_key()
+            # [MODIFIED] Thông báo peer connected để Client tự request certificate thay vì Server chia sẻ key
+            with self.clients_lock:
+                if len(self.clients) == 2:
+                    client_ids = list(self.clients.keys())
+                    self.clients[client_ids[0]].send({"type": "peer_joined", "peer_id": client_ids[1], "initiator": True})
+                    self.clients[client_ids[1]].send({"type": "peer_joined", "peer_id": client_ids[0], "initiator": False})
 
             while True:
                 raw_line = file_reader.readline()
@@ -178,7 +145,30 @@ class RelayServer:
                     break
 
                 data = json.loads(raw_line)
-                if data.get("type") == "chat":
+                
+                # [NEW] API Request Certificate theo username
+                if data.get("type") == "cert_request":
+                    target_id = data.get("target_id")
+                    target_cert = self.ca.get_certificate(target_id)
+                    if target_cert:
+                        conn.send({"type": "cert_response", "target_id": target_id, "certificate": target_cert})
+                        print(f"[SERVER] Đã trả Certificate của {target_id} cho {client_id}")
+                    else:
+                        conn.send({"type": "error", "message": "Certificate not found"})
+                        
+                # [NEW] API Directory Request (Xem danh sách user đã đăng ký)
+                elif data.get("type") == "directory_request":
+                    users = list(self.ca.cert_repository.keys())
+                    conn.send({"type": "directory_response", "users": users})
+                    
+                # [NEW] Chuyển tiếp session key từ initiator sang peer
+                elif data.get("type") == "relay_session_key":
+                    target_id = data.get("target_id")
+                    if target_id in self.clients:
+                        self.clients[target_id].send(data)
+                        print(f"[SERVER] Đã chuyển tiếp session_key từ {client_id} sang {target_id}")
+
+                elif data.get("type") == "chat":
                     self.audit.log_event(
                         AuditEventType.MESSAGE_SENT,
                         user_id=client_id,
