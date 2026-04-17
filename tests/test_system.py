@@ -5,24 +5,47 @@ Tests for Key Management System
 import unittest
 import os
 import shutil
+import logging
+from cryptography.exceptions import InvalidKey
 from src.key_management import KeyStore, KeyMetadata
 from src.identity_management import IdentityManagementSystem, Role, Permission
 from src.secure_transmission import SecureTransmissionChannel
 from src.audit_logging import AuditLogger, AuditEventType
 
 
-class TestKeyManagement(unittest.TestCase):
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(asctime)s %(name)s - %(message)s"
+)
+logger = logging.getLogger("tests.test_system")
+
+
+class LoggedTestCase(unittest.TestCase):
+    """Base test case with start/end logs for each test."""
+
+    def setUp(self):
+        logger.info("START %s.%s", self.__class__.__name__, self._testMethodName)
+
+    def tearDown(self):
+        logger.info("END   %s.%s", self.__class__.__name__, self._testMethodName)
+
+
+class TestKeyManagement(LoggedTestCase):
     """Test Key Management"""
     
     def setUp(self):
+        super().setUp()
         self.test_path = "test_keys"
+        logger.info("Preparing key test storage at %s", self.test_path)
         if os.path.exists(self.test_path):
             shutil.rmtree(self.test_path)
         self.key_store = KeyStore(self.test_path)
     
     def tearDown(self):
+        logger.info("Cleaning key test storage at %s", self.test_path)
         if os.path.exists(self.test_path):
             shutil.rmtree(self.test_path)
+        super().tearDown()
     
     def test_generate_symmetric_key(self):
         """Test sinh khóa đối xứng"""
@@ -43,6 +66,36 @@ class TestKeyManagement(unittest.TestCase):
         )
         self.assertIsNotNone(key_id)
         self.assertIsNotNone(pub_id)
+
+    def test_generate_password_protected_rsa_private_key(self):
+        """Test private key RSA được bảo vệ bằng password"""
+        key_id, _ = self.key_store.generate_asymmetric_key_pair(
+            "test_rsa_pwd",
+            "alice",
+            "Signing",
+            private_key_password="StrongPass@123"
+        )
+
+        private_key = self.key_store.get_private_key(
+            key_id,
+            private_key_password="StrongPass@123"
+        )
+        self.assertIsNotNone(private_key)
+
+    def test_get_private_key_with_wrong_password(self):
+        """Test không thể mở private key khi password sai"""
+        key_id, _ = self.key_store.generate_asymmetric_key_pair(
+            "test_rsa_wrong_pwd",
+            "alice",
+            "Signing",
+            private_key_password="RightPass@123"
+        )
+
+        with self.assertRaises((TypeError, ValueError, InvalidKey)):
+            self.key_store.get_private_key(
+                key_id,
+                private_key_password="WrongPass@123"
+            )
     
     def test_key_rotation(self):
         """Test xoay vòng khóa"""
@@ -52,6 +105,33 @@ class TestKeyManagement(unittest.TestCase):
             "Test"
         )
         new_key_id = self.key_store.rotate_key(key_id)
+        self.assertNotEqual(key_id, new_key_id)
+
+    def test_rotate_password_protected_rsa_requires_password(self):
+        """Test rotate RSA có password protection phải yêu cầu password"""
+        key_id, _ = self.key_store.generate_asymmetric_key_pair(
+            "rotate_rsa_pwd",
+            "alice",
+            "Signing",
+            private_key_password="RotatePass@123"
+        )
+
+        with self.assertRaises(ValueError):
+            self.key_store.rotate_key(key_id)
+
+    def test_rotate_password_protected_rsa_with_password(self):
+        """Test rotate RSA có password protection khi cung cấp password đúng"""
+        key_id, _ = self.key_store.generate_asymmetric_key_pair(
+            "rotate_rsa_pwd_ok",
+            "alice",
+            "Signing",
+            private_key_password="RotatePass@123"
+        )
+
+        new_key_id = self.key_store.rotate_key(
+            key_id,
+            private_key_password="RotatePass@123"
+        )
         self.assertNotEqual(key_id, new_key_id)
     
     def test_key_revocation(self):
@@ -75,18 +155,22 @@ class TestKeyManagement(unittest.TestCase):
             self.key_store.revoke_key("missing_key")
 
 
-class TestIdentityManagement(unittest.TestCase):
+class TestIdentityManagement(LoggedTestCase):
     """Test Identity Management"""
     
     def setUp(self):
+        super().setUp()
         self.test_path = "test_identity"
+        logger.info("Preparing identity test storage at %s", self.test_path)
         if os.path.exists(self.test_path):
             shutil.rmtree(self.test_path)
         self.iam = IdentityManagementSystem(self.test_path)
     
     def tearDown(self):
+        logger.info("Cleaning identity test storage at %s", self.test_path)
         if os.path.exists(self.test_path):
             shutil.rmtree(self.test_path)
+        super().tearDown()
     
     def test_create_user(self):
         """Test tạo người dùng"""
@@ -139,12 +223,14 @@ class TestIdentityManagement(unittest.TestCase):
         self.assertFalse(self.iam.check_permission(user.user_id, admin_perm))
 
 
-class TestSecureTransmission(unittest.TestCase):
+class TestSecureTransmission(LoggedTestCase):
     """Test Secure Transmission"""
     
     def setUp(self):
+        super().setUp()
         self.channel = SecureTransmissionChannel()
         self.key = os.urandom(32)  # AES-256 key
+        logger.info("Generated ephemeral AES-256 test key")
     
     def test_aes_256_cbc_encryption(self):
         """Test mã hóa AES-256-CBC"""
@@ -184,18 +270,22 @@ class TestSecureTransmission(unittest.TestCase):
         self.assertFalse(is_valid)
 
 
-class TestAuditLogging(unittest.TestCase):
+class TestAuditLogging(LoggedTestCase):
     """Test Audit Logging"""
     
     def setUp(self):
+        super().setUp()
         self.test_path = "test_audit"
+        logger.info("Preparing audit test storage at %s", self.test_path)
         if os.path.exists(self.test_path):
             shutil.rmtree(self.test_path)
         self.audit = AuditLogger(self.test_path)
     
     def tearDown(self):
+        logger.info("Cleaning audit test storage at %s", self.test_path)
         if os.path.exists(self.test_path):
             shutil.rmtree(self.test_path)
+        super().tearDown()
     
     def test_log_event(self):
         """Test ghi sự kiện"""

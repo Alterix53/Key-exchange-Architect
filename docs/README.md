@@ -91,7 +91,7 @@ IAM_Key_Management_System/
 
     Tất cả khóa đều được:
     - Mã hóa bằng Master Key
-    - Lưu trữ với quyền cao (0o600)
+    - Lưu trữ với quyền cao (0o600) // 4 + 2 -> quyền chỉ đọc và viết của admin
     - Ghi lại metadata (sinh, hết hạn, người chủ sở hữu)
 
 3.4 Xoay vòng Khóa
