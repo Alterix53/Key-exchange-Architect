@@ -88,7 +88,7 @@ class RelayClient:
                 raise RuntimeError(packet.get("message", "Server error"))
 
             if packet_type == "cert":
-                cert = packet.get("certificate", {})
+                cert = packet.get("certificate", "")
                 print(f"[STATUS] Đã nhận Certificate của chính mình từ Server.")
                 continue
                 
