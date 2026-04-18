@@ -2,11 +2,13 @@ import base64
 import hashlib
 import json
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Union
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography import x509
+from cryptography.x509.oid import NameOID
 
 import os
 
@@ -48,10 +50,15 @@ class CertificateAuthority:
                 ))
             print("[CA] Khởi tạo hệ thống khóa CA mới và lưu vào đĩa (data/ca_private.pem, data/ca_public.pem).")
 
-    def _load_certificates(self) -> Dict[str, Dict]:
+    def _load_certificates(self) -> Dict[str, str]:
         if os.path.exists(self.cert_repository_file):
-            with open(self.cert_repository_file, "r") as f:
-                return json.load(f)
+            try:
+                with open(self.cert_repository_file, "r") as f:
+                    data = json.load(f)
+                    # Lọc bỏ các format certificate JSON cũ (chỉ chấp nhận chuỗi PEM)
+                    return {k: v for k, v in data.items() if isinstance(v, str)}
+            except Exception:
+                return {}
         return {}
 
     def _save_certificates(self):
@@ -65,95 +72,97 @@ class CertificateAuthority:
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         ).decode("utf-8")
 
-    def issue_certificate(self, subject: str, public_key_pem: str) -> Dict:
-        """Tạo chứng chỉ cho một User/Client mới"""
-        issued_at = datetime.now()
+    def issue_certificate(self, subject: str, public_key_pem: str) -> str:
+        """Tạo chứng chỉ X.509 chuẩn cho một User/Client mới"""
+        issued_at = datetime.utcnow()
+        valid_to = issued_at + timedelta(days=30)
         
-        # Cấu trúc chứng chỉ
-        cert_payload = {
-            "serial_number": base64.b16encode(hashlib.sha256(f"{subject}:{issued_at.isoformat()}".encode("utf-8")).digest()[:8]).decode("ascii"),
-            "issuer": "IAM-Relay-Server-CA",
-            "subject": subject,
-            "public_key": public_key_pem,
-            "valid_from": issued_at.isoformat(),
-            "valid_to": (issued_at + timedelta(days=30)).isoformat(),  # Certificate expiration check (BONUS)
-        }
+        # Load public key từ PEM
+        client_public_key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
         
-        # Ký chứng chỉ
-        signing_input = json.dumps(cert_payload, sort_keys=True).encode("utf-8")
-        signature = self.ca_private_key.sign(
-            signing_input,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
+        # Thiết lập thông tin Subject và Issuer
+        subject_name = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, subject),
+        ])
+        issuer_name = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "IAM-Relay-Server-CA"),
+        ])
+        
+        # Build chứng chỉ X.509
+        cert_builder = x509.CertificateBuilder()
+        cert_builder = cert_builder.subject_name(subject_name)
+        cert_builder = cert_builder.issuer_name(issuer_name)
+        cert_builder = cert_builder.public_key(client_public_key)
+        cert_builder = cert_builder.serial_number(x509.random_serial_number())
+        cert_builder = cert_builder.not_valid_before(issued_at)
+        cert_builder = cert_builder.not_valid_after(valid_to)
+        
+        # Ký chứng chỉ bằng Private Key của CA (mặc định với RSA dùng PKCS1v15 padding)
+        certificate = cert_builder.sign(
+            self.ca_private_key, hashes.SHA256()
         )
-        cert_payload["signature"] = base64.b64encode(signature).decode("utf-8")
+        
+        # Xuất ra chuỗi PEM
+        cert_pem = certificate.public_bytes(serialization.Encoding.PEM).decode("utf-8")
         
         # Lưu vào repository và disk
-        self.cert_repository[subject] = cert_payload
+        self.cert_repository[subject] = cert_pem
         self._save_certificates()
-        return cert_payload
+        return cert_pem
 
-    def get_certificate(self, subject: str) -> Optional[Dict]:
+    def get_certificate(self, subject: str) -> Optional[str]:
         """Truy xuất chứng chỉ bằng Username/ID"""
-        return self.cert_repository.get(subject)
+        cert = self.cert_repository.get(subject)
+        if isinstance(cert, dict):
+            return None # Bỏ qua chứng chỉ định dạng cũ nếu vô tình sót
+        return cert
 
-    def revoke_certificate(self, serial_number: str) -> None:
+    def revoke_certificate(self, serial_number: Union[str, int]) -> None:
         """Thu hồi chứng chỉ (Thêm vào CRL) - Tùy chọn nâng cao"""
         self.crl.add(serial_number)
 
-def verify_certificate(cert: Dict, ca_public_key_pem: str, expected_subject: str = None, crl: set = None) -> bool:
+def verify_certificate(cert_pem: str, ca_public_key_pem: str, expected_subject: str = None, crl: set = None) -> bool:
     """
-    Xác minh tính hợp lệ của chứng chỉ:
-    1. Kiểm tra cấu trúc
-    2. Chữ ký số từ CA
-    3. Hết hạn (Expiration)
+    Xác minh tính hợp lệ của chứng chỉ X.509:
+    1. Chữ ký số từ CA
+    2. Hết hạn (Expiration)
+    3. Hợp lệ Subject 
     4. Bị thu hồi chưa (CRL)
     """
     try:
-        # Check required fields structure
-        required_fields = ["serial_number", "issuer", "subject", "public_key", "valid_from", "valid_to", "signature"]
-        if not all(field in cert for field in required_fields):
-            print("[ERROR] Certificate lacks required fields.")
-            return False
+        # Load X.509 Certificate
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        ca_public_key = serialization.load_pem_public_key(ca_public_key_pem.encode("utf-8"))
+        
+        # 1. Verify signature
+        # Hàm verify của public key rsa hỗ trợ kiểm tra chữ ký cho Data Payload (tbs_certificate_bytes)
+        # padding thường được sử dụng cho chứng chỉ X.509 ký bằng RSA là PKCS1v15
+        ca_public_key.verify(
+            cert.signature,
+            cert.tbs_certificate_bytes,
+            padding.PKCS1v15(),
+            cert.signature_hash_algorithm
+        )
 
-        # Bind identity to certificate usage: Check Subject
-        if expected_subject and cert.get("subject") != expected_subject:
-            print(f"[ERROR] Certificate subject '{cert.get('subject')}' does KHÔNG khớp với user dự kiến '{expected_subject}'!")
-            return False
+        # 2. Bind identity to certificate usage: Check Subject
+        if expected_subject:
+            cn_attributes = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+            if not cn_attributes or cn_attributes[0].value != expected_subject:
+                cn = cn_attributes[0].value if cn_attributes else "Unknown"
+                print(f"[ERROR] Certificate subject '{cn}' does KHÔNG khớp với user dự kiến '{expected_subject}'!")
+                return False
 
-        # Check Revocation (Bonus)
-        if crl and cert.get("serial_number") in crl:
+        # 3. Check Revocation (Bonus)
+        if crl and cert.serial_number in crl:
             print("[ERROR] Certificate has been revoked (in CRL).")
             return False
 
-        # Check Expiration (Bonus)
-        valid_to = datetime.fromisoformat(cert.get("valid_to"))
-        if datetime.now() > valid_to:
-            print("[ERROR] Certificate is expired.")
+        # 4. Check Expiration (Bonus)
+        now = datetime.utcnow()
+        if now < cert.not_valid_before or now > cert.not_valid_after:
+            print("[ERROR] Certificate is expired or not yet valid.")
             return False
 
-        # Extract signature and payload
-        signature_b64 = cert.get("signature")
-        signature = base64.b64decode(signature_b64)
-        
-        payload_copy = cert.copy()
-        del payload_copy["signature"]
-        signing_input = json.dumps(payload_copy, sort_keys=True).encode("utf-8")
-        
-        # Verify signature
-        ca_public_key = serialization.load_pem_public_key(ca_public_key_pem.encode("utf-8"))
-        ca_public_key.verify(
-            signature,
-            signing_input,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
         return True
     except InvalidSignature:
         print("[ERROR] Invalid certificate signature.")
@@ -162,9 +171,7 @@ def verify_certificate(cert: Dict, ca_public_key_pem: str, expected_subject: str
         print(f"[ERROR] Certificate verification failed: {e}")
         return False
 
-def extract_public_key(cert: Dict) -> Any:
+def extract_public_key(cert_pem: str) -> Any:
     """Trích xuất Public Key Object từ Cert để sử dụng chia sẻ khóa"""
-    public_key_pem = cert.get("public_key")
-    if not public_key_pem:
-        raise ValueError("No public key in certificate")
-    return serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    return cert.public_key()

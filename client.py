@@ -132,6 +132,7 @@ class IAMDemoClient:
 
     def _receive_loop(self):
         while self._running:
+
             try:
                 line = self.reader.readline()
                 if not line:
