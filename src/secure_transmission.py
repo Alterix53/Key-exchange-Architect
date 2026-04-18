@@ -87,6 +87,8 @@ class SecureTransmissionChannel:
         Trả về: (nonce_base64, ciphertext_base64, tag_base64)
         """
         nonce = os.urandom(12)  # 96-bit nonce cho GCM
+
+        # Khởi tạo cipher với GCM mode
         cipher = Cipher(
             algorithms.AES(key),
             modes.GCM(nonce),
@@ -94,9 +96,11 @@ class SecureTransmissionChannel:
         )
         encryptor = cipher.encryptor()
         
+        # thêm dữ liệu liên kết (associated data) nếu có
         if associated_data:
             encryptor.authenticate_additional_data(associated_data.encode('utf-8'))
         
+        # mã hóa plaintext
         ciphertext = encryptor.update(plaintext.encode('utf-8')) + encryptor.finalize()
         
         return (
@@ -157,7 +161,7 @@ class SecureTransmissionChannel:
     # ============ Chữ ký số ============
     
     def sign_message(self, message_content: str, private_key) -> str:
-        """Ký thông điệp bằng RSA"""
+        # Ký thông điệp bằng RSA private key user đó
         signature = private_key.sign(
             message_content.encode('utf-8'),
             padding.PSS(

@@ -7,10 +7,13 @@ import hashlib
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Dict, List, Set, Optional
+from typing import Dict, List, Set, Optional, TYPE_CHECKING
 from enum import Enum
 import secrets
 import base64
+
+if TYPE_CHECKING:
+    from .storage_backend import UserStorage
 
 
 class Role(Enum):
@@ -140,6 +143,7 @@ class User:
             'user_id': self.user_id,
             'username': self.username,
             'email': self.email,
+            'password_hash': self.password_hash,
             'roles': [role.value for role in self.roles],
             'created_at': self.created_at.isoformat(),
             'last_login': self.last_login.isoformat() if self.last_login else None,
@@ -181,9 +185,15 @@ class Session:
 
 class IdentityManagementSystem:
     """Hệ thống quản lý danh tính"""
-    def __init__(self, storage_path: str = "iam_storage"):
+    def __init__(self, storage_path: str = "iam_storage", storage: Optional['UserStorage'] = None):
         self.storage_path = storage_path
-        os.makedirs(storage_path, exist_ok=True)
+        
+        # Storage Backend: mặc định dùng JSON file, có thể thay bằng SQL Server
+        if storage is not None:
+            self.storage = storage
+        else:
+            from .storage_backend import JsonFileUserStorage
+            self.storage = JsonFileUserStorage(storage_path)
         
         self.users: Dict[str, User] = {}
         self.sessions: Dict[str, Session] = {}
@@ -322,30 +332,24 @@ class IdentityManagementSystem:
             self.sessions[session_id].is_active = False
     
     def _save_user(self, user: User):
-        """Lưu người dùng"""
-        user_path = os.path.join(self.storage_path, f"{user.user_id}.json")
-        with open(user_path, 'w') as f:
-            json.dump(user.to_dict(), f, indent=2)
+        """Lưu người dùng qua storage backend"""
+        self.storage.save_user(user.to_dict())
     
     def _load_users(self):
-        """Tải các người dùng"""
-        for filename in os.listdir(self.storage_path):
-            if filename.endswith('.json'):
-                user_path = os.path.join(self.storage_path, filename)
-                with open(user_path, 'r') as f:
-                    data = json.load(f)
-                    user = User(
-                        data['user_id'],
-                        data['username'],
-                        data['email'],
-                        data.get('password_hash', ''),
-                        [Role(r) for r in data.get('roles', ['user'])]
-                    )
-                    user.is_active = data['is_active']
-                    user.mfa_enabled = data['mfa_enabled']
-                    user.groups = data.get('groups', [])
-                    user.attributes = data.get('attributes', {})
-                    self.users[user.user_id] = user
+        """Tải các người dùng từ storage backend"""
+        for data in self.storage.load_all_users():
+            user = User(
+                data['user_id'],
+                data['username'],
+                data['email'],
+                data.get('password_hash', ''),
+                [Role(r) for r in data.get('roles', ['user'])]
+            )
+            user.is_active = data.get('is_active', True)
+            user.mfa_enabled = data.get('mfa_enabled', False)
+            user.groups = data.get('groups', [])
+            user.attributes = data.get('attributes', {})
+            self.users[user.user_id] = user
     
     def list_users(self) -> List[Dict]:
         """Liệt kê người dùng"""
