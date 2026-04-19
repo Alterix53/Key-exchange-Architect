@@ -205,11 +205,30 @@ class IAMDemoClient:
     def _handle_peer_session_key(self, data: Dict):
         try:
             encrypted_key = data.get("encrypted_key", "")
+            signature = data.get("signature", "")
+            sender_cert = data.get("sender_cert", "")
+            sender_id = data.get("sender_id", "")
+            
+            if not signature or not sender_cert:
+                print(f"\n{Colors.FAIL}[LỖI MUTUAL AUTH] Gói tin Session Key thiếu Chữ ký hoặc Chứng chỉ từ {sender_id}. Bị từ chối!{Colors.ENDC}")
+                return
+                
+            # Trích xuất Public Key của người gửi từ Chứng chỉ đính kèm
+            peer_pub_key = extract_public_key(sender_cert)
+            
+            # Giải mã lấy Raw Session Key (vẫn dạng base64)
             key_b64 = self.channel.decrypt_rsa_oaep(encrypted_key, self.private_key)
+            
+            # Verify chữ ký bằng đúng Raw Session Key b64
+            is_valid_sig = self.channel.verify_signature(key_b64, signature, peer_pub_key)
+            if not is_valid_sig:
+                print(f"\n{Colors.FAIL}[LỖI MUTUAL AUTH] Chữ ký số từ {sender_id} KHÔNG HỢP LỆ! Nghi ngờ giả mạo. Bị từ chối!{Colors.ENDC}")
+                return
+                
             self.chat_session_key = base64.b64decode(key_b64)
-            print(f"\n{Colors.OKGREEN}[STATUS] Đã nhận session key từ {data.get('sender_id')}. Sẵn sàng Chat!{Colors.ENDC}")
+            print(f"\n{Colors.OKGREEN}[STATUS] Mutual Auth thành công! Đã nhận session key từ {sender_id}. Sẵn sàng Chat!{Colors.ENDC}")
         except Exception as e:
-            print(f"\n{Colors.FAIL}[LỖI KEY XCHG] Không thể giải mã session key: {str(e)}{Colors.ENDC}")
+            print(f"\n{Colors.FAIL}[LỖI KEY XCHG] Không thể giải mã/xác nhận session key: {str(e)}{Colors.ENDC}")
 
     # ------------------ MENUS & UI ------------------
 
@@ -459,18 +478,25 @@ class IAMDemoClient:
         print_success("Certificate hợp lệ.")
         self.chat_peer_public_key = extract_public_key(cert)
         
-        print("[2] Khởi tạo Key Exchange (RSA)...")
+        print("[2] Khởi tạo Key Exchange (RSA) và Ký hiệu (Digital Signature)...")
         self.chat_session_key = os.urandom(32)
+        session_key_b64 = base64.b64encode(self.chat_session_key).decode("utf-8")
+        
+        # Mã hóa bằng Public Key của đối tác
         encrypted_key = self.channel.encrypt_rsa_oaep(
-            base64.b64encode(self.chat_session_key).decode("utf-8"), 
+            session_key_b64, 
             self.chat_peer_public_key
         )
+        
+        # Ký điện tử Payload (giữ tính nguyên vẹn và xác thực bằng Private Key của mình)
+        signature = self.channel.sign_message(session_key_b64, self.private_key)
         
         self._send_req({
             "type": "relay",
             "relay_type": "session_key",
             "target_id": target_uid,
-            "encrypted_key": encrypted_key
+            "encrypted_key": encrypted_key,
+            "signature": signature
         })
         print_success("Đã gửi Session Key. Sẵn sàng chat!")
         

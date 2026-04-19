@@ -271,6 +271,7 @@ class IAMBackendServer:
         elif relay_type == "session_key":
             req["type"] = "peer_session_key"
             req["sender_id"] = user_id
+            req["sender_cert"] = self.ca.get_certificate(user_id)
             del req["relay_type"]
             target_conn.send(req)
             
