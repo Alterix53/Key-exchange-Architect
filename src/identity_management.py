@@ -55,6 +55,9 @@ class RoleBasedAccessControl:
                 Permission("users", "update"),
                 Permission("users", "delete"),
                 Permission("audit", "read"),
+                Permission("chat", "discover"),
+                Permission("chat", "send"),
+                Permission("chat", "receive"),
             },
             Role.MANAGER: {
                 Permission("keys", "read"),
@@ -66,6 +69,9 @@ class RoleBasedAccessControl:
             Role.USER: {
                 Permission("keys", "read"),
                 Permission("audit", "read_own"),
+                Permission("chat", "discover"),
+                Permission("chat", "send"),
+                Permission("chat", "receive"),
             },
             Role.GUEST: {
                 Permission("keys", "read_public"),

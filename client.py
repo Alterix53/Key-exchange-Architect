@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-from src.secure_transmission import SecureTransmissionChannel
+from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
 from src.public_key_distribution import verify_certificate, extract_public_key
 
 # ANSI Colors
@@ -53,6 +53,7 @@ class IAMDemoClient:
         
         # Crypto
         self.channel = SecureTransmissionChannel()
+        self.replay_protector = ReplayProtector(time_window_seconds=30)
         self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self.public_key = self.private_key.public_key()
         
@@ -103,6 +104,13 @@ class IAMDemoClient:
     def _send_req(self, req: Dict) -> None:
         if self.session_id:
             req["session_id"] = self.session_id
+            
+        import secrets
+        if "timestamp" not in req:
+            req["timestamp"] = datetime.now().isoformat()
+        if "msg_nonce" not in req:
+            req["msg_nonce"] = secrets.token_hex(16)
+            
         data = (json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8")
         self.sock.sendall(data)
 
@@ -139,6 +147,12 @@ class IAMDemoClient:
                     break
                     
                 data = json.loads(line)
+                
+                # Check Anti-Replay
+                if not self.replay_protector.check_replay(data.get("timestamp"), data.get("msg_nonce")):
+                    print(f"\n{Colors.WARNING}[CẢNH BÁO] Đã chặn một message không hợp lệ hoặc Replay Attack từ client/server!{Colors.ENDC}")
+                    continue
+                    
                 req_type = data.get("type", "")
                 
                 # Chat mode handlers
@@ -230,7 +244,35 @@ class IAMDemoClient:
         if res:
             self.session_id = res.get("session_id")
             self.user_info = res.get("user")
+            self.username = username
             print_success(f"Đăng nhập thành công! Xin chào, {self.user_info.get('username')}.")
+            
+            # --- START FIX PERSISTENT RSA KEYS CHO E2E ---
+            os.makedirs("demo_keys", exist_ok=True)
+            priv_path = os.path.join("demo_keys", f"{self.user_info.get('user_id')}_private.pem")
+            
+            from cryptography.hazmat.backends import default_backend
+            if os.path.exists(priv_path):
+                # Tải khóa cũ nếu đã có
+                with open(priv_path, "rb") as f:
+                    self.private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
+                self.public_key = self.private_key.public_key()
+            else:
+                # Lưu khóa mới nếu chưa có
+                with open(priv_path, "wb") as f:
+                    f.write(self.private_key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.TraditionalOpenSSL,
+                        encryption_algorithm=serialization.NoEncryption()
+                    ))
+            
+            # Tự động cập nhật PKI Certificate ngầm định với CA mỗi khi login
+            # Để luôn public key mới nhất / hoặc có sẵn trên Server
+            self._sync_request({
+                "type": "cert_req",
+                "public_key": self._public_key_pem()
+            }, "cert_info")
+            # --- END FIX ---
 
     def do_register(self):
         print_header("Đăng ký tài khoản mới")
@@ -372,9 +414,19 @@ class IAMDemoClient:
                 roles = ','.join(u['roles'])
                 print(f" • {u['username']} (ID: {u['user_id']}) | Vai trò: {roles} | {status}")
 
+    def do_chat_directory(self):
+        print_header("Danh bạ Chat E2E (Tối giản)")
+        res = self._sync_request({"type": "chat_directory"}, "chat_directory_response")
+        if res:
+            for u in res.get("users", []):
+                status = f"{Colors.OKGREEN}Online{Colors.ENDC}" if u['online'] else "Offline"
+                cert_status = "Có" if u['has_cert'] else "Không"
+                print(f" • {u['username']} (ID: {u['user_id']}) | Trạng thái: {status} | Đã ĐK Cert: {cert_status}")
+
     def do_chat_e2e(self):
         print_header("Chế độ Chat Mã hóa E2E")
-        self.do_list_users() # Show ds de ho chon
+        self.do_chat_directory() # Show danh bạ thu gọn
+
         target_uid = input("\nNhập User ID muốn chat: ").strip()
         if not target_uid:
             return

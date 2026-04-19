@@ -23,7 +23,7 @@ from src.identity_management import IdentityManagementSystem, Role, Permission
 from src.key_management import KeyStore
 from src.audit_logging import AuditLogger, AuditEventType
 from src.public_key_distribution import CertificateAuthority
-from src.secure_transmission import SecureTransmissionChannel
+from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
 
 def send_json(sock: socket.socket, payload: Dict) -> None:
     try:
@@ -41,6 +41,11 @@ class ClientConnection:
     write_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def send(self, payload: Dict) -> None:
+        import secrets
+        if "timestamp" not in payload:
+            payload["timestamp"] = datetime.now().isoformat()
+        if "msg_nonce" not in payload:
+            payload["msg_nonce"] = secrets.token_hex(16)
         with self.write_lock:
             send_json(self.sock, payload)
 
@@ -56,6 +61,7 @@ class IAMBackendServer:
         self.audit_logger = AuditLogger("demo_audit")
         self.ca = CertificateAuthority(data_dir="data")
         self.channel = SecureTransmissionChannel()
+        self.replay_protector = ReplayProtector(time_window_seconds=30)
         
         self.clients: Dict[socket.socket, ClientConnection] = {}
         self.clients_lock = threading.Lock()
@@ -72,18 +78,19 @@ class IAMBackendServer:
             conn.send({"type": "error", "message": "auth_required: Missing session_id"})
             return None
             
-        session = self.iam.validate_session(session_id)
-        if not session:
+        is_valid = self.iam.validate_session(session_id)
+        if not is_valid:
             conn.send({"type": "error", "message": "auth_required: Invalid or expired session"})
             return None
         
         # Liên kết kết nối với user
+        session_obj = self.iam.sessions.get(session_id)
         with self.clients_lock:
             conn.session_id = session_id
-            conn.user_id = session.user_id
-            self.active_users[session.user_id] = conn
+            conn.user_id = session_obj.user_id
+            self.active_users[session_obj.user_id] = conn
             
-        return session.user_id
+        return session_obj.user_id
 
     def _check_permission(self, user_id: str, resource: str, action: str) -> bool:
         """Kiểm tra quyền qua RBAC"""
@@ -169,6 +176,25 @@ class IAMBackendServer:
                 "online": uid in self.active_users
             })
         conn.send({"type": "directory_list", "users": users_list})
+
+    def handle_chat_directory(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
+        """Lấy danh bạ thu gọn phục vụ riêng cho E2E Chat"""
+        if not self._check_permission(user_id, "chat", "discover"):
+            conn.send({"type": "error", "message": "Access Denied: chat:discover"})
+            return
+            
+        chat_users = []
+        for uid, user in self.iam.users.items():
+            if not user.is_active:
+                continue
+            # Chỉ trả về các trường cần thiết phục vụ chat (ẩn role, email...)
+            chat_users.append({
+                "user_id": uid,
+                "username": user.username,
+                "online": uid in self.active_users,
+                "has_cert": self.ca.get_certificate(uid) is not None
+            })
+        conn.send({"type": "chat_directory_response", "users": chat_users})
 
     def handle_audit_query(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
         """Lấy audit logs"""
@@ -286,6 +312,13 @@ class IAMBackendServer:
                     break
                     
                 req = json.loads(raw_line)
+                
+                # Chống replay attack (Kiểm tra xem req có timestamp/msg_nonce hợp lệ không)
+                if not self.replay_protector.check_replay(req.get("timestamp"), req.get("msg_nonce")):
+                    print(f"[X] Blocked replayed or invalid payload from {client_addr}")
+                    conn.send({"type": "error", "message": "Replay attack detected or invalid timestamp/msg_nonce"})
+                    continue
+                
                 req_type = req.get("type")
                 
                 # Public Endpoints
@@ -305,6 +338,8 @@ class IAMBackendServer:
                     self.handle_cert_request(req, conn, user_id)
                 elif req_type == "directory":
                     self.handle_directory(req, conn, user_id)
+                elif req_type == "chat_directory":
+                    self.handle_chat_directory(req, conn, user_id)
                 elif req_type == "audit_query":
                     self.handle_audit_query(req, conn, user_id)
                 elif req_type == "key_list":
@@ -317,7 +352,9 @@ class IAMBackendServer:
                     conn.send({"type": "error", "message": f"Unknown request type: {req_type}"})
                     
         except Exception as e:
+            import traceback
             print(f"[ERROR] Connection handling failed for {client_addr}: {e}")
+            traceback.print_exc()
         finally:
             with self.clients_lock:
                 if client_sock in self.clients:
