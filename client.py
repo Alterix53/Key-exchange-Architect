@@ -88,11 +88,15 @@ class IAMDemoClient:
             self._receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
             self._receive_thread.start()
             
-            # Load CA PublicKey nếu có (fallback)
+            # Load CA PublicKey (PINNED TRUSTED ROOT)
             ca_path = "data/ca_public.pem"
             if os.path.exists(ca_path):
                 with open(ca_path, "r") as f:
                     self.ca_public_key_pem = f.read()
+            else:
+                print_error(f"LỖI: Không tìm thấy Trusted CA Root tại '{ca_path}'!")
+                print_error("Hệ thống từ chối kết nối để bảo vệ khỏi MITM (Fail-Closed).")
+                sys.exit(1)
 
             import time
             time.sleep(0.5) # Để kịp nhận dòng welcome
@@ -392,7 +396,8 @@ class IAMDemoClient:
         }, "cert_info")
         if res:
             cert = res.get("certificate", {})
-            self.ca_public_key_pem = res.get("ca_public_key")
+            # BỎ QUA CA Public Key từ network để tránh bị MITM
+            # self.ca_public_key_pem = res.get("ca_public_key")
             print_success("Đã nhận chứng chỉ từ CA.")
             print(json.dumps(cert, indent=2))
 
@@ -415,7 +420,7 @@ class IAMDemoClient:
                 print(f" • {u['username']} (ID: {u['user_id']}) | Vai trò: {roles} | {status}")
 
     def do_chat_directory(self):
-        print_header("Danh bạ Chat E2E (Tối giản)")
+        print_header("Danh bạ Chat E2E")
         res = self._sync_request({"type": "chat_directory"}, "chat_directory_response")
         if res:
             for u in res.get("users", []):
