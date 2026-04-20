@@ -97,7 +97,7 @@ class KeyStore:
     
     def generate_asymmetric_key_pair(self, key_id: str, owner: str, purpose: str,
                                     key_size: int = 2048,
-                                    private_key_password: Optional[str] = None) -> Tuple[str, str]:
+                                    private_key_password: Optional[str] = None) -> Tuple[str, str, str]:
         """Sinh cặp khóa RSA"""
         private_key = rsa.generate_private_key(
             public_exponent=65537,
@@ -139,7 +139,7 @@ class KeyStore:
         self._save_private_key(key_id, encrypted_private, metadata)
         self._save_public_key(key_id, public_pem)
         
-        return key_id, f"{key_id}_pub"
+        return key_id, f"{key_id}_pub", private_pem.decode('utf-8')
     
     def _encrypt_key(self, key: bytes) -> bytes:
         """Mã hóa khóa bằng Master Key (AES-256-GCM, có xác thực toàn vẹn)"""

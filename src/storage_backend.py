@@ -305,21 +305,77 @@ class SqlServerUserStorage(UserStorage):
 
     def __init__(self, connection_string: str):
         self.connection_string = connection_string
-        # import pyodbc
-        # self.conn = pyodbc.connect(connection_string)
-        raise NotImplementedError(
-            "SqlServerUserStorage chưa được triển khai. "
-            "Cần cài đặt pyodbc và cấu hình SQL Server connection string."
-        )
+        import pyodbc
+        try:
+            conn = pyodbc.connect(connection_string)
+            conn.close()
+        except pyodbc.Error as e:
+            raise RuntimeError(f"Cannot connect to SQL Server: {e}")
 
     def save_user(self, user_dict: Dict) -> None:
-        raise NotImplementedError
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        
+        roles_json = json.dumps(user_dict.get('roles', ['user']))
+        last_login = user_dict.get('last_login')
+        if last_login == "": last_login = None
+        
+        cursor.execute("SELECT 1 FROM Users WHERE user_id = ?", user_dict['user_id'])
+        exists = cursor.fetchone()
+        
+        if exists:
+            cursor.execute('''
+                UPDATE Users SET 
+                    username = ?, email = ?, password_hash = ?, roles = ?, 
+                    mfa_secret = ?, mfa_enabled = ?, status = ?, last_login = ?
+                WHERE user_id = ?
+            ''', (
+                user_dict['username'], user_dict['email'], user_dict['password_hash'], 
+                roles_json, user_dict.get('mfa_secret'), user_dict.get('mfa_enabled', False), 
+                user_dict.get('status', 'active'), last_login, user_dict['user_id']
+            ))
+        else:
+            cursor.execute('''
+                INSERT INTO Users (user_id, username, email, password_hash, roles, mfa_secret, mfa_enabled, status, created_at, last_login)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_dict['user_id'], user_dict['username'], user_dict['email'], user_dict['password_hash'], 
+                roles_json, user_dict.get('mfa_secret'), user_dict.get('mfa_enabled', False), 
+                user_dict.get('status', 'active'), user_dict.get('created_at'), last_login
+            ))
+        conn.close()
 
     def load_all_users(self) -> List[Dict]:
-        raise NotImplementedError
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string)
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, username, email, password_hash, roles, mfa_secret, mfa_enabled, status, created_at, last_login FROM Users")
+        
+        users = []
+        for row in cursor.fetchall():
+            user_dict = {
+                'user_id': row.user_id,
+                'username': row.username,
+                'email': row.email,
+                'password_hash': row.password_hash,
+                'roles': json.loads(row.roles),
+                'mfa_secret': row.mfa_secret,
+                'mfa_enabled': bool(row.mfa_enabled),
+                'status': row.status,
+                'created_at': row.created_at.isoformat() if row.created_at else None,
+                'last_login': row.last_login.isoformat() if row.last_login else None
+            }
+            users.append(user_dict)
+        conn.close()
+        return users
 
     def delete_user(self, user_id: str) -> None:
-        raise NotImplementedError
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM Users WHERE user_id = ?", user_id)
+        conn.close()
 
 
 class SqlServerKeyStorage(KeyStorage):
@@ -354,39 +410,129 @@ class SqlServerKeyStorage(KeyStorage):
 
     def __init__(self, connection_string: str):
         self.connection_string = connection_string
-        raise NotImplementedError(
-            "SqlServerKeyStorage chưa được triển khai."
-        )
 
     def load_or_create_master_key(self) -> bytes:
-        raise NotImplementedError
+        import pyodbc
+        import secrets
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        cursor.execute("SELECT key_payload FROM KeysData WHERE key_id = 'master_key' AND key_type = 'master'")
+        row = cursor.fetchone()
+        if row:
+            master_key = row.key_payload
+        else:
+            master_key = secrets.token_bytes(32)
+            cursor.execute("INSERT INTO KeysData (key_id, key_type, key_payload) VALUES ('master_key', 'master', ?)", master_key)
+        conn.close()
+        return master_key
 
     def save_key_bytes(self, key_id: str, data: bytes) -> None:
-        raise NotImplementedError
+        self._upsert_key_data(key_id, 'symmetric', data)
 
     def load_key_bytes(self, key_id: str) -> Optional[bytes]:
-        raise NotImplementedError
+        return self._load_key_data(key_id, 'symmetric')
 
     def save_private_key_bytes(self, key_id: str, data: bytes) -> None:
-        raise NotImplementedError
+        self._upsert_key_data(key_id, 'private', data)
 
     def load_private_key_bytes(self, key_id: str) -> Optional[bytes]:
-        raise NotImplementedError
+        return self._load_key_data(key_id, 'private')
 
     def save_public_key_bytes(self, key_id: str, data: bytes) -> None:
-        raise NotImplementedError
+        self._upsert_key_data(key_id, 'public', data)
 
     def load_public_key_bytes(self, key_id: str) -> Optional[bytes]:
-        raise NotImplementedError
+        return self._load_key_data(key_id, 'public')
+        
+    def _upsert_key_data(self, key_id: str, key_type: str, data: bytes) -> None:
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM KeysData WHERE key_id = ? AND key_type = ?", (key_id, key_type))
+        exists = cursor.fetchone()
+        if exists:
+            cursor.execute("UPDATE KeysData SET key_payload = ? WHERE key_id = ? AND key_type = ?", (data, key_id, key_type))
+        else:
+            cursor.execute("INSERT INTO KeysData (key_id, key_type, key_payload) VALUES (?, ?, ?)", (key_id, key_type, data))
+        conn.close()
+        
+    def _load_key_data(self, key_id: str, key_type: str) -> Optional[bytes]:
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string)
+        cursor = conn.cursor()
+        cursor.execute("SELECT key_payload FROM KeysData WHERE key_id = ? AND key_type = ?", (key_id, key_type))
+        row = cursor.fetchone()
+        conn.close()
+        if row: return row.key_payload
+        return None
 
     def save_metadata(self, key_id: str, metadata_dict: Dict) -> None:
-        raise NotImplementedError
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM KeysMetadata WHERE key_id = ?", key_id)
+        exists = cursor.fetchone()
+        
+        last_rot = metadata_dict.get('last_rotated')
+        expires = metadata_dict.get('expires_at')
+        if last_rot == "": last_rot = None
+        if expires == "": expires = None
+        
+        if exists:
+            cursor.execute('''
+                UPDATE KeysMetadata SET
+                    owner_id = ?, algorithm = ?, key_size = ?, purpose = ?,
+                    is_active = ?, version = ?, expires_at = ?, last_rotated = ?
+                WHERE key_id = ?
+            ''', (
+                metadata_dict.get('owner', metadata_dict.get('owner_id', 'system')), 
+                metadata_dict.get('algorithm', 'AES-256'), metadata_dict.get('key_size', 256), 
+                metadata_dict.get('purpose'), metadata_dict.get('is_active', True), 
+                metadata_dict.get('version', 1), expires, last_rot, key_id
+            ))
+        else:
+            cursor.execute('''
+                INSERT INTO KeysMetadata (key_id, owner_id, algorithm, key_size, purpose, is_active, version, creation_date, expires_at, last_rotated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                key_id, metadata_dict.get('owner', metadata_dict.get('owner_id', 'system')), metadata_dict.get('algorithm', 'AES-256'), 
+                metadata_dict.get('key_size', 256), metadata_dict.get('purpose'), 
+                metadata_dict.get('is_active', True), metadata_dict.get('version', 1), 
+                metadata_dict.get('created_at'), expires, last_rot
+            ))
+        conn.close()
 
     def load_metadata(self, key_id: str) -> Optional[Dict]:
-        raise NotImplementedError
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string)
+        cursor = conn.cursor()
+        cursor.execute("SELECT key_id, owner_id, algorithm, key_size, purpose, is_active, version, creation_date, expires_at, last_rotated FROM KeysMetadata WHERE key_id = ?", key_id)
+        row = cursor.fetchone()
+        conn.close()
+        if not row: return None
+        
+        return {
+            'key_id': row.key_id,
+            'owner': row.owner_id,
+            'owner_id': row.owner_id,
+            'algorithm': row.algorithm,
+            'key_size': row.key_size,
+            'purpose': row.purpose,
+            'is_active': bool(row.is_active),
+            'version': row.version,
+            'creation_date': row.creation_date.isoformat() if row.creation_date else None,
+            'expires_at': row.expires_at.isoformat() if row.expires_at else None,
+            'last_rotated': row.last_rotated.isoformat() if row.last_rotated else None
+        }
 
     def list_key_ids(self) -> List[str]:
-        raise NotImplementedError
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string)
+        cursor = conn.cursor()
+        cursor.execute("SELECT key_id FROM KeysMetadata")
+        ids = [row.key_id for row in cursor.fetchall()]
+        conn.close()
+        return ids
 
 
 class SqlServerAuditStorage(AuditStorage):
@@ -414,15 +560,62 @@ class SqlServerAuditStorage(AuditStorage):
 
     def __init__(self, connection_string: str):
         self.connection_string = connection_string
-        raise NotImplementedError(
-            "SqlServerAuditStorage chưa được triển khai."
-        )
 
     def save_log(self, log_dict: Dict) -> None:
-        raise NotImplementedError
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        
+        details_json = None
+        if 'details' in log_dict and log_dict['details']:
+            details_json = json.dumps(log_dict['details'])
+            
+        cursor.execute('''
+            INSERT INTO AuditLogs (event_id, timestamp, event_type, user_id, resource, action, result, details_json, ip_address, user_agent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            log_dict.get('log_id', secrets.token_hex(8)), log_dict.get('timestamp'), 
+            log_dict.get('event_type'), log_dict.get('user_id'), log_dict.get('resource'), 
+            log_dict.get('action'), log_dict.get('result', 'success'), details_json, 
+            log_dict.get('ip_address'), log_dict.get('user_agent')
+        ))
+        conn.close()
 
     def load_all_logs(self) -> List[Dict]:
-        raise NotImplementedError
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string)
+        cursor = conn.cursor()
+        cursor.execute("SELECT event_id, timestamp, event_type, user_id, resource, action, result, details_json, ip_address, user_agent FROM AuditLogs ORDER BY timestamp ASC")
+        
+        logs = []
+        for row in cursor.fetchall():
+            logs.append({
+                'log_id': row.event_id,
+                'event_id': row.event_id,
+                'timestamp': row.timestamp.isoformat() if row.timestamp else None,
+                'event_type': row.event_type,
+                'user_id': row.user_id,
+                'resource': row.resource,
+                'action': row.action,
+                'result': row.result,
+                'details': json.loads(row.details_json) if row.details_json else {},
+                'ip_address': row.ip_address,
+                'user_agent': row.user_agent
+            })
+        conn.close()
+        return logs
 
     def export_logs(self, logs: List[Dict], fmt: str, output_file: str) -> str:
-        raise NotImplementedError
+        if fmt == "json":
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(logs, f, indent=2, default=str, ensure_ascii=False)
+        elif fmt == "csv":
+            import csv
+            output_file = output_file.replace('.json', '.csv')
+            if logs:
+                keys = logs[0].keys()
+                with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=keys)
+                    writer.writeheader()
+                    writer.writerows(logs)
+        return output_file

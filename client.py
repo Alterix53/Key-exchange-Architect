@@ -116,6 +116,7 @@ class IAMDemoClient:
 
             self._send_req(req)
             
+            # tính thời gian chờ, timeout nếu quá lâu
             start_time = time.time()
             while time.time() - start_time < timeout:
                 if wait_for_type in self.pending_responses:
@@ -309,27 +310,45 @@ class IAMDemoClient:
 
     def do_key_gen(self):
         print_header("Sinh khóa mới")
-        print("Chọn thuật toán:")
-        print("  1. AES-256 (Đối xứng)")
-        print("  2. AES-128 (Đối xứng)")
-        print("  3. RSA-2048 (Bất đối xứng)")
+        print("Thuật toán được hỗ trợ:")
+        print("  1. RSA-2048 (Bất đối xứng)")
         
-        algo_c = input("Chọn: ")
-        algo = "AES-256"
-        if algo_c == "2": algo = "AES-128"
-        elif algo_c == "3": algo = "RSA-2048"
+        algo_c = input("Chọn (1): ")
+        private_key_password = None
+        algo = "RSA-2048"
+        
+        print("Khóa Bất đối xứng (RSA) sẽ được trả về dạng file .pem cho bạn lưu giữ.")
+        pwd = input("Nhập mật khẩu bảo vệ khóa Private Key (Enter để bỏ qua nếu không cần): ").strip()
+        if pwd:
+            private_key_password = pwd
         
         name = input("Tên khóa: ")
         purp = input("Mục đích: ")
         
-        res = self._sync_request({
+        req_payload = {
             "type": "key_gen",
             "algorithm": algo,
             "key_name": name,
             "purpose": purp
-        }, "key_gen_ok")
+        }
+        if private_key_password:
+            req_payload["private_key_password"] = private_key_password
+            
+        res = self._sync_request(req_payload, "key_gen_ok")
         if res:
-            print_success(f"Khóa '{name}' ({algo}) đã được sinh thành công! (ID: {res.get('key_id')})")
+            key_id = res.get('key_id')
+            print_success(f"Khóa '{name}' ({algo}) đã được sinh thành công! (ID: {key_id})")
+            
+            private_pem = res.get("private_key_pem")
+            if private_pem:
+                try:
+                    os.makedirs("data", exist_ok=True)
+                    file_path = f"data/{name}_private.pem"
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(private_pem)
+                    print_success(f"Đã lưu Private Key thành công tại: {file_path}")
+                except Exception as e:
+                    print_error(f"Không thể lưu Private Key ra file: {e}\nNội dung PEM:\n{private_pem}")
 
     def do_key_list(self):
         print_header("Danh sách KHÓA")

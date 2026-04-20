@@ -64,8 +64,10 @@ class RoleBasedAccessControl:
                 Permission("audit", "read"),
             },
             Role.USER: {
+                Permission("keys", "create"),
                 Permission("keys", "read"),
                 Permission("audit", "read_own"),
+                Permission("users", "read") # cần biết ai online
             },
             Role.GUEST: {
                 Permission("keys", "read_public"),

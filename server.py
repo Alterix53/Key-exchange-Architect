@@ -45,15 +45,29 @@ class ClientConnection:
             send_json(self.sock, payload)
 
 class IAMBackendServer:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, db_type: str = "json"):
         self.host = host
         self.port = port
         
         # 1. Khởi tạo IAM Modules
-        print("[INIT] Đang tải các phân hệ IAM...")
-        self.iam = IdentityManagementSystem("demo_identity")
-        self.key_store = KeyStore("demo_keys")
-        self.audit_logger = AuditLogger("demo_audit")
+        print(f"[INIT] Đang tải các phân hệ IAM (Backend: {db_type})...")
+        
+        if db_type == "sqlserver":
+            from src.db_setup import get_connection_string
+            from src.storage_backend import SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage
+            conn_str = get_connection_string("IAM_KMS_DB")
+            user_storage = SqlServerUserStorage(conn_str)
+            key_storage = SqlServerKeyStorage(conn_str)
+            audit_storage = SqlServerAuditStorage(conn_str)
+            
+            self.iam = IdentityManagementSystem("demo_identity", storage=user_storage)
+            self.key_store = KeyStore("demo_keys", storage=key_storage)
+            self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
+        else:
+            self.iam = IdentityManagementSystem("demo_identity")
+            self.key_store = KeyStore("demo_keys")
+            self.audit_logger = AuditLogger("demo_audit")
+            
         self.ca = CertificateAuthority(data_dir="data")
         self.channel = SecureTransmissionChannel()
         
@@ -72,18 +86,23 @@ class IAMBackendServer:
             conn.send({"type": "error", "message": "auth_required: Missing session_id"})
             return None
             
-        session = self.iam.validate_session(session_id)
-        if not session:
+        is_valid = self.iam.validate_session(session_id)
+        if not is_valid:
             conn.send({"type": "error", "message": "auth_required: Invalid or expired session"})
+            return None
+            
+        session_obj = self.iam.sessions.get(session_id)
+        if not session_obj:
+            conn.send({"type": "error", "message": "auth_required: Invalid session"})
             return None
         
         # Liên kết kết nối với user
         with self.clients_lock:
             conn.session_id = session_id
-            conn.user_id = session.user_id
-            self.active_users[session.user_id] = conn
+            conn.user_id = session_obj.user_id
+            self.active_users[session_obj.user_id] = conn
             
-        return session.user_id
+        return session_obj.user_id
 
     def _check_permission(self, user_id: str, resource: str, action: str) -> bool:
         """Kiểm tra quyền qua RBAC"""
@@ -203,17 +222,30 @@ class IAMBackendServer:
         algorithm = req.get("algorithm", "AES-256")
         key_name = req.get("key_name", f"key_{datetime.now().timestamp()}")
         purpose = req.get("purpose", "General")
+        private_key_password = req.get("private_key_password")
         
         try:
+            private_key_pem = None
             if algorithm.startswith("AES"):
                 k_id = self.key_store.generate_symmetric_key(key_name, user_id, purpose, algorithm)
             elif algorithm.startswith("RSA"):
-                k_id, _ = self.key_store.generate_asymmetric_key_pair(key_name, user_id, purpose)
+                k_id, _, private_key_pem = self.key_store.generate_asymmetric_key_pair(
+                    key_name, user_id, purpose, private_key_password=private_key_password
+                )
             else:
                 raise ValueError("Unsupported algorithm")
                 
             self.audit_logger.log_event(AuditEventType.KEY_GENERATED, user_id, "backend", "key_gen", "success", details={"key_id": k_id, "algo": algorithm})
-            conn.send({"type": "key_gen_ok", "key_id": k_id, "message": "Đã sinh khóa thành công"})
+            
+            res_payload = {
+                "type": "key_gen_ok", 
+                "key_id": k_id, 
+                "message": "Đã sinh khóa thành công"
+            }
+            if private_key_pem:
+                res_payload["private_key_pem"] = private_key_pem
+                
+            conn.send(res_payload)
         except Exception as e:
             conn.send({"type": "error", "message": str(e)})
 
@@ -351,9 +383,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IAM Backend Server")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind")
     parser.add_argument("--port", type=int, default=5000, help="Port to bind")
+    parser.add_argument("--db", default="json", choices=["json", "sqlserver"], help="Database backend to use")
     args = parser.parse_args()
 
-    server = IAMBackendServer(args.host, args.port)
+    server = IAMBackendServer(args.host, args.port, args.db)
     try:
         server.start()
     except KeyboardInterrupt:
