@@ -159,7 +159,16 @@ def verify_certificate(cert_pem: str, ca_public_key_pem: str, expected_subject: 
 
         # 4. Check Expiration (Bonus)
         now = datetime.utcnow()
-        if now < cert.not_valid_before or now > cert.not_valid_after:
+        try:
+            # Dùng các thuộc tính mới _utc nếu có (hỗ trợ các bản mới của cryptography)
+            not_before = cert.not_valid_before_utc.replace(tzinfo=None)
+            not_after = cert.not_valid_after_utc.replace(tzinfo=None)
+        except AttributeError:
+            # Fallback cho các bản cũ
+            not_before = cert.not_valid_before
+            not_after = cert.not_valid_after
+
+        if now < not_before or now > not_after:
             print("[ERROR] Certificate is expired or not yet valid.")
             return False
 

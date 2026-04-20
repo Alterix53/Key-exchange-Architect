@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
-from src.secure_transmission import SecureTransmissionChannel
+from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
 from src.public_key_distribution import verify_certificate, extract_public_key
 
 # ANSI Colors
@@ -53,6 +53,7 @@ class IAMDemoClient:
         
         # Crypto
         self.channel = SecureTransmissionChannel()
+        self.replay_protector = ReplayProtector(time_window_seconds=30)
         self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self.public_key = self.private_key.public_key()
         
@@ -87,11 +88,15 @@ class IAMDemoClient:
             self._receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
             self._receive_thread.start()
             
-            # Load CA PublicKey nếu có (fallback)
+            # Load CA PublicKey (PINNED TRUSTED ROOT)
             ca_path = "data/ca_public.pem"
             if os.path.exists(ca_path):
                 with open(ca_path, "r") as f:
                     self.ca_public_key_pem = f.read()
+            else:
+                print_error(f"LỖI: Không tìm thấy Trusted CA Root tại '{ca_path}'!")
+                print_error("Hệ thống từ chối kết nối để bảo vệ khỏi MITM (Fail-Closed).")
+                sys.exit(1)
 
             import time
             time.sleep(0.5) # Để kịp nhận dòng welcome
@@ -103,6 +108,13 @@ class IAMDemoClient:
     def _send_req(self, req: Dict) -> None:
         if self.session_id:
             req["session_id"] = self.session_id
+            
+        import secrets
+        if "timestamp" not in req:
+            req["timestamp"] = datetime.now().isoformat()
+        if "msg_nonce" not in req:
+            req["msg_nonce"] = secrets.token_hex(16)
+            
         data = (json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8")
         self.sock.sendall(data)
 
@@ -140,6 +152,12 @@ class IAMDemoClient:
                     break
                     
                 data = json.loads(line)
+                
+                # Check Anti-Replay
+                if not self.replay_protector.check_replay(data.get("timestamp"), data.get("msg_nonce")):
+                    print(f"\n{Colors.WARNING}[CẢNH BÁO] Đã chặn một message không hợp lệ hoặc Replay Attack từ client/server!{Colors.ENDC}")
+                    continue
+                    
                 req_type = data.get("type", "")
                 
                 # Chat mode handlers
@@ -188,11 +206,30 @@ class IAMDemoClient:
     def _handle_peer_session_key(self, data: Dict):
         try:
             encrypted_key = data.get("encrypted_key", "")
+            signature = data.get("signature", "")
+            sender_cert = data.get("sender_cert", "")
+            sender_id = data.get("sender_id", "")
+            
+            if not signature or not sender_cert:
+                print(f"\n{Colors.FAIL}[LỖI MUTUAL AUTH] Gói tin Session Key thiếu Chữ ký hoặc Chứng chỉ từ {sender_id}. Bị từ chối!{Colors.ENDC}")
+                return
+                
+            # Trích xuất Public Key của người gửi từ Chứng chỉ đính kèm
+            peer_pub_key = extract_public_key(sender_cert)
+            
+            # Giải mã lấy Raw Session Key (vẫn dạng base64)
             key_b64 = self.channel.decrypt_rsa_oaep(encrypted_key, self.private_key)
+            
+            # Verify chữ ký bằng đúng Raw Session Key b64
+            is_valid_sig = self.channel.verify_signature(key_b64, signature, peer_pub_key)
+            if not is_valid_sig:
+                print(f"\n{Colors.FAIL}[LỖI MUTUAL AUTH] Chữ ký số từ {sender_id} KHÔNG HỢP LỆ! Nghi ngờ giả mạo. Bị từ chối!{Colors.ENDC}")
+                return
+                
             self.chat_session_key = base64.b64decode(key_b64)
-            print(f"\n{Colors.OKGREEN}[STATUS] Đã nhận session key từ {data.get('sender_id')}. Sẵn sàng Chat!{Colors.ENDC}")
+            print(f"\n{Colors.OKGREEN}[STATUS] Mutual Auth thành công! Đã nhận session key từ {sender_id}. Sẵn sàng Chat!{Colors.ENDC}")
         except Exception as e:
-            print(f"\n{Colors.FAIL}[LỖI KEY XCHG] Không thể giải mã session key: {str(e)}{Colors.ENDC}")
+            print(f"\n{Colors.FAIL}[LỖI KEY XCHG] Không thể giải mã/xác nhận session key: {str(e)}{Colors.ENDC}")
 
     # ------------------ MENUS & UI ------------------
 
@@ -231,7 +268,35 @@ class IAMDemoClient:
         if res:
             self.session_id = res.get("session_id")
             self.user_info = res.get("user")
+            self.username = username
             print_success(f"Đăng nhập thành công! Xin chào, {self.user_info.get('username')}.")
+            
+            # --- START FIX PERSISTENT RSA KEYS CHO E2E ---
+            os.makedirs("demo_keys", exist_ok=True)
+            priv_path = os.path.join("demo_keys", f"{self.user_info.get('user_id')}_private.pem")
+            
+            from cryptography.hazmat.backends import default_backend
+            if os.path.exists(priv_path):
+                # Tải khóa cũ nếu đã có
+                with open(priv_path, "rb") as f:
+                    self.private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
+                self.public_key = self.private_key.public_key()
+            else:
+                # Lưu khóa mới nếu chưa có
+                with open(priv_path, "wb") as f:
+                    f.write(self.private_key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.TraditionalOpenSSL,
+                        encryption_algorithm=serialization.NoEncryption()
+                    ))
+            
+            # Tự động cập nhật PKI Certificate ngầm định với CA mỗi khi login
+            # Để luôn public key mới nhất / hoặc có sẵn trên Server
+            self._sync_request({
+                "type": "cert_req",
+                "public_key": self._public_key_pem()
+            }, "cert_info")
+            # --- END FIX ---
 
     def do_register(self):
         print_header("Đăng ký tài khoản mới")
@@ -369,7 +434,8 @@ class IAMDemoClient:
         }, "cert_info")
         if res:
             cert = res.get("certificate", {})
-            self.ca_public_key_pem = res.get("ca_public_key")
+            # BỎ QUA CA Public Key từ network để tránh bị MITM
+            # self.ca_public_key_pem = res.get("ca_public_key")
             print_success("Đã nhận chứng chỉ từ CA.")
             print(json.dumps(cert, indent=2))
 
@@ -391,9 +457,19 @@ class IAMDemoClient:
                 roles = ','.join(u['roles'])
                 print(f" • {u['username']} (ID: {u['user_id']}) | Vai trò: {roles} | {status}")
 
+    def do_chat_directory(self):
+        print_header("Danh bạ Chat E2E")
+        res = self._sync_request({"type": "chat_directory"}, "chat_directory_response")
+        if res:
+            for u in res.get("users", []):
+                status = f"{Colors.OKGREEN}Online{Colors.ENDC}" if u['online'] else "Offline"
+                cert_status = "Có" if u['has_cert'] else "Không"
+                print(f" • {u['username']} (ID: {u['user_id']}) | Trạng thái: {status} | Đã ĐK Cert: {cert_status}")
+
     def do_chat_e2e(self):
         print_header("Chế độ Chat Mã hóa E2E")
-        self.do_list_users() # Show ds de ho chon
+        self.do_chat_directory() # Show danh bạ thu gọn
+
         target_uid = input("\nNhập User ID muốn chat: ").strip()
         if not target_uid:
             return
@@ -421,18 +497,25 @@ class IAMDemoClient:
         print_success("Certificate hợp lệ.")
         self.chat_peer_public_key = extract_public_key(cert)
         
-        print("[2] Khởi tạo Key Exchange (RSA)...")
+        print("[2] Khởi tạo Key Exchange (RSA) và Ký hiệu (Digital Signature)...")
         self.chat_session_key = os.urandom(32)
+        session_key_b64 = base64.b64encode(self.chat_session_key).decode("utf-8")
+        
+        # Mã hóa bằng Public Key của đối tác
         encrypted_key = self.channel.encrypt_rsa_oaep(
-            base64.b64encode(self.chat_session_key).decode("utf-8"), 
+            session_key_b64, 
             self.chat_peer_public_key
         )
+        
+        # Ký điện tử Payload (giữ tính nguyên vẹn và xác thực bằng Private Key của mình)
+        signature = self.channel.sign_message(session_key_b64, self.private_key)
         
         self._send_req({
             "type": "relay",
             "relay_type": "session_key",
             "target_id": target_uid,
-            "encrypted_key": encrypted_key
+            "encrypted_key": encrypted_key,
+            "signature": signature
         })
         print_success("Đã gửi Session Key. Sẵn sàng chat!")
         

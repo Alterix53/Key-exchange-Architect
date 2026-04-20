@@ -55,6 +55,9 @@ class RoleBasedAccessControl:
                 Permission("users", "update"),
                 Permission("users", "delete"),
                 Permission("audit", "read"),
+                Permission("chat", "discover"),
+                Permission("chat", "send"),
+                Permission("chat", "receive"),
             },
             Role.MANAGER: {
                 Permission("keys", "read"),
@@ -67,7 +70,13 @@ class RoleBasedAccessControl:
                 Permission("keys", "create"),
                 Permission("keys", "read"),
                 Permission("audit", "read_own"),
+<<<<<<< HEAD
                 Permission("users", "read") # cần biết ai online
+=======
+                Permission("chat", "discover"),
+                Permission("chat", "send"),
+                Permission("chat", "receive"),
+>>>>>>> 5c9c5fb9f5611518aeb389f7c6d61a5141656cde
             },
             Role.GUEST: {
                 Permission("keys", "read_public"),
