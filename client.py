@@ -253,8 +253,12 @@ class IAMDemoClient:
             sender_cert = data.get("sender_cert", "")
             sender_id = data.get("sender_id", "")
             
-            if not signature or not sender_cert:
+            if not signature or not sender_cert or not sender_id:
                 print(f"\n{Colors.FAIL}[LỖI MUTUAL AUTH] Gói tin Session Key thiếu Chữ ký hoặc Chứng chỉ từ {sender_id}. Bị từ chối!{Colors.ENDC}")
+                return
+
+            if not self.ca_public_key_pem:
+                print(f"\n{Colors.FAIL}[LỖI MUTUAL AUTH] Thiếu trusted CA key. Bị từ chối!{Colors.ENDC}")
                 return
                 
             # --- MUTUAL AUTH: XÁC THỰC SENDER TRƯỚC KHI TIN TƯỞNG PUBLIC KEY ---
