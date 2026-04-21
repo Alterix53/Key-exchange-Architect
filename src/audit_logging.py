@@ -45,6 +45,17 @@ class AuditEventType(Enum):
     MFA_VERIFICATION_SUCCESS = "mfa_verification_success"
     MFA_VERIFICATION_FAILED = "mfa_verification_failed"
     
+    # Certificate / PKI
+    CERT_CSR_RECEIVED = "cert_csr_received"
+    CERT_ISSUED = "cert_issued"
+    CERT_REVOKED = "cert_revoked"
+    CERT_VERIFIED = "cert_verified"
+    CERT_VERIFICATION_FAILED = "cert_verification_failed"
+    CERT_CHAIN_VALIDATED = "cert_chain_validated"
+    CERT_CHAIN_VALIDATION_FAILED = "cert_chain_validation_failed"
+    CRL_UPDATED = "crl_updated"
+    CERT_RENEWED = "cert_renewed"
+    
     # Hệ thống
     SYSTEM_ERROR = "system_error"
     SUSPICIOUS_ACTIVITY = "suspicious_activity"
