@@ -6,11 +6,14 @@ import unittest
 import os
 import shutil
 import logging
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
 from cryptography.exceptions import InvalidKey
 from src.key_management import KeyStore, KeyMetadata
 from src.identity_management import IdentityManagementSystem, Role, Permission
 from src.secure_transmission import SecureTransmissionChannel
 from src.audit_logging import AuditLogger, AuditEventType
+from src.public_key_distribution import CertificateAuthority, verify_certificate, extract_public_key
 
 
 logging.basicConfig(
@@ -268,6 +271,71 @@ class TestSecureTransmission(LoggedTestCase):
         tampered = "Modified data"
         is_valid = self.channel.verify_hmac(tampered, hmac_value, self.key)
         self.assertFalse(is_valid)
+
+
+class TestMutualAuthentication(LoggedTestCase):
+    """Test mutual authentication client-server"""
+
+    def setUp(self):
+        super().setUp()
+        self.test_path = "test_mutual_auth"
+        logger.info("Preparing mutual auth test storage at %s", self.test_path)
+        if os.path.exists(self.test_path):
+            shutil.rmtree(self.test_path)
+        self.ca = CertificateAuthority(self.test_path)
+        self.channel = SecureTransmissionChannel()
+
+    def tearDown(self):
+        logger.info("Cleaning mutual auth test storage at %s", self.test_path)
+        if os.path.exists(self.test_path):
+            shutil.rmtree(self.test_path)
+        super().tearDown()
+
+    def test_server_proof_of_possession(self):
+        server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        server_pub_pem = server_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("utf-8")
+        server_cert = self.ca.issue_certificate("IAM-Server", server_pub_pem)
+
+        server_nonce = "server-nonce-123"
+        server_signature = self.channel.sign_message(f"{server_nonce}|IAM-Server", server_key)
+
+        self.assertTrue(
+            verify_certificate(server_cert, self.ca.get_public_key_pem(), expected_subject="IAM-Server")
+        )
+        server_public_key = extract_public_key(server_cert)
+        self.assertTrue(
+            self.channel.verify_signature(f"{server_nonce}|IAM-Server", server_signature, server_public_key)
+        )
+
+    def test_client_proof_of_possession(self):
+        client_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        client_pub_pem = client_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("utf-8")
+        client_cert = self.ca.issue_certificate("alice", client_pub_pem)
+
+        server_nonce = "server-nonce-456"
+        client_nonce = "client-nonce-789"
+        client_signature = self.channel.sign_message(
+            f"{server_nonce}|{client_nonce}|alice",
+            client_key
+        )
+
+        self.assertTrue(
+            verify_certificate(client_cert, self.ca.get_public_key_pem(), expected_subject="alice")
+        )
+        client_public_key = extract_public_key(client_cert)
+        self.assertTrue(
+            self.channel.verify_signature(
+                f"{server_nonce}|{client_nonce}|alice",
+                client_signature,
+                client_public_key
+            )
+        )
 
 
 class TestAuditLogging(LoggedTestCase):

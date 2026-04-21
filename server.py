@@ -10,6 +10,7 @@ import socket
 import threading
 import os
 import sys
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Optional, List
@@ -38,6 +39,7 @@ class ClientConnection:
     file_reader: Any
     session_id: Optional[str] = None
     user_id: Optional[str] = None
+    server_nonce: Optional[str] = None
     write_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def send(self, payload: Dict) -> None:
@@ -74,6 +76,38 @@ class IAMBackendServer:
             self.audit_logger = AuditLogger("demo_audit")
             
         self.ca = CertificateAuthority(data_dir="data")
+        
+        # --- MUTUAL AUTH: Khởi tạo Server Identity ---
+        server_priv_path = "data/server_private.pem"
+        server_cert_path = "data/server_cert.pem"
+        
+        if os.path.exists(server_priv_path) and os.path.exists(server_cert_path):
+            with open(server_priv_path, "rb") as f:
+                self.server_private_key = serialization.load_pem_private_key(f.read(), password=None)
+            with open(server_cert_path, "r", encoding="utf-8") as f:
+                self.server_cert_pem = f.read()
+            print("[SERVER] Đã tải Server Certificate từ file.")
+        else:
+            print("[SERVER] Khởi tạo Server Identity mới...")
+            self.server_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            with open(server_priv_path, "wb") as f:
+                f.write(self.server_private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+            server_pub_pem = self.server_private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            ).decode("utf-8")
+            
+            # Yêu cầu CA cấp chứng chỉ với Subject là IAM-Server
+            self.server_cert_pem = self.ca.issue_certificate("IAM-Server", server_pub_pem)
+            with open(server_cert_path, "w", encoding="utf-8") as f:
+                f.write(self.server_cert_pem)
+            print("[SERVER] Đã tạo và cấp Server Certificate mới (IAM-Server).")
+        # --- END MUTUAL AUTH ---
+        
         self.channel = SecureTransmissionChannel()
         self.replay_protector = ReplayProtector(time_window_seconds=30)
         
@@ -127,20 +161,45 @@ class IAMBackendServer:
         """Xử lý đăng nhập"""
         username = req.get("username", "")
         password = req.get("password", "")
+        client_public_key_pem = req.get("client_public_key")
+        client_nonce = req.get("client_nonce")
+        client_proof = req.get("client_proof")
         
         session = self.iam.authenticate_user(username, password, ip)
         if session:
+            if not client_public_key_pem or not client_nonce or not client_proof or not conn.server_nonce:
+                conn.send({"type": "error", "message": "Mutual auth failed: missing client proof material"})
+                return
+
+            try:
+                client_public_key = serialization.load_pem_public_key(client_public_key_pem.encode("utf-8"))
+            except Exception:
+                conn.send({"type": "error", "message": "Mutual auth failed: invalid client public key"})
+                return
+
+            proof_message = f"{conn.server_nonce}|{client_nonce}|{username}"
+            if not self.channel.verify_signature(proof_message, client_proof, client_public_key):
+                conn.send({"type": "error", "message": "Mutual auth failed: invalid client proof"})
+                return
+
             self.audit_logger.log_event(AuditEventType.USER_LOGIN, session.user_id, "backend", "login", "success", ip_address=ip)
             user_info = self.iam.users[session.user_id].to_dict()
             with self.clients_lock:
                 conn.session_id = session.session_id
                 conn.user_id = session.user_id
                 self.active_users[session.user_id] = conn
+
+            server_auth_proof = self.channel.sign_message(
+                f"{session.session_id}|{client_nonce}|login_ok",
+                self.server_private_key
+            )
                 
             conn.send({
                 "type": "login_ok",
                 "session_id": session.session_id,
-                "user": user_info
+                "user": user_info,
+                "server_auth_proof": server_auth_proof,
+                "server_cert": self.server_cert_pem
             })
         else:
             self.audit_logger.log_event(AuditEventType.USER_FAILED_LOGIN, username, "backend", "login", "failed", ip_address=ip)
@@ -331,8 +390,17 @@ class IAMBackendServer:
             self.clients[client_sock] = conn
             
         # Send Welcome JSON
+        # --- MUTUAL AUTH: Send Server Certificate ---
+        conn.server_nonce = secrets.token_urlsafe(24)
+        server_hello_signature = self.channel.sign_message(
+            f"{conn.server_nonce}|IAM-Server",
+            self.server_private_key
+        )
         conn.send({
-            "type": "welcome", 
+            "type": "server_hello", 
+            "certificate": self.server_cert_pem,
+            "server_nonce": conn.server_nonce,
+            "server_signature": server_hello_signature,
             "message": "Connected to IAM Backend Server. Please login or register."
         })
         
