@@ -7,8 +7,11 @@ import os
 import json
 import hashlib
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, TYPE_CHECKING
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
+
+if TYPE_CHECKING:
+    from .storage_backend import KeyStorage
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.backends import default_backend
@@ -19,12 +22,14 @@ import base64
 class KeyMetadata:
     """Metadata cho mỗi khóa"""
     def __init__(self, key_id: str, owner: str, algorithm: str, key_size: int, 
-                 purpose: str, expiry_days: int = 365):
+                 purpose: str, expiry_days: int = 365,
+                 private_key_password_protected: bool = False):
         self.key_id = key_id
         self.owner = owner
         self.algorithm = algorithm
         self.key_size = key_size
         self.purpose = purpose
+        self.private_key_password_protected = private_key_password_protected
         self.created_at = datetime.now()
         self.expires_at = datetime.now() + timedelta(days=expiry_days)
         self.last_rotated = datetime.now()
@@ -38,6 +43,7 @@ class KeyMetadata:
             'algorithm': self.algorithm,
             'key_size': self.key_size,
             'purpose': self.purpose,
+            'private_key_password_protected': self.private_key_password_protected,
             'created_at': self.created_at.isoformat(),
             'expires_at': self.expires_at.isoformat(),
             'last_rotated': self.last_rotated.isoformat(),
@@ -51,37 +57,35 @@ class KeyMetadata:
 
 class KeyStore:
     """Lưu trữ khóa an toàn"""
-    def __init__(self, storage_path: str = "keys_storage"):
+    def __init__(self, storage_path: str = "keys_storage", storage: Optional['KeyStorage'] = None):
         self.storage_path = storage_path
-        os.makedirs(storage_path, exist_ok=True)
+        
+        if storage is not None:
+            self.storage = storage
+        else:
+            from .storage_backend import JsonFileKeyStorage
+            self.storage = JsonFileKeyStorage(storage_path)
+            
         self.keys_metadata: Dict[str, KeyMetadata] = {}
         self.master_key = self._load_or_create_master_key()
         
     def _load_or_create_master_key(self) -> bytes:
         """Tạo hoặc tải Master Key để mã hóa khóa khác"""
-        master_key_path = os.path.join(self.storage_path, "master.key")
-        if os.path.exists(master_key_path):
-            with open(master_key_path, 'rb') as f:
-                return f.read()
-        else:
-            master_key = secrets.token_bytes(32)  # 256-bit key
-            with open(master_key_path, 'wb') as f:
-                f.write(master_key)
-            os.chmod(master_key_path, 0o600)  # Read/write for owner only
-            return master_key
+        return self.storage.load_or_create_master_key()
     
     def generate_symmetric_key(self, key_id: str, owner: str, purpose: str, 
                               algorithm: str = "AES-256") -> str:
         """Sinh khóa đối xứng"""
         if algorithm == "AES-256":
-            key = secrets.token_bytes(32)  # 256 bits
+            key = secrets.token_bytes(32)  # Tạo khóa 256 bits
             key_size = 256
         elif algorithm == "AES-128":
-            key = secrets.token_bytes(16)  # 128 bits
+            key = secrets.token_bytes(16)  # Tạo khóa 128 bits
             key_size = 128
         else:
             raise ValueError(f"Không hỗ trợ thuật toán: {algorithm}")
         
+        # lưu metadata của khóa
         metadata = KeyMetadata(key_id, owner, algorithm, key_size, purpose)
         self.keys_metadata[key_id] = metadata
         
@@ -92,7 +96,8 @@ class KeyStore:
         return key_id
     
     def generate_asymmetric_key_pair(self, key_id: str, owner: str, purpose: str,
-                                    key_size: int = 2048) -> Tuple[str, str]:
+                                    key_size: int = 2048,
+                                    private_key_password: Optional[str] = None) -> Tuple[str, str, str]:
         """Sinh cặp khóa RSA"""
         private_key = rsa.generate_private_key(
             public_exponent=65537,
@@ -101,14 +106,28 @@ class KeyStore:
         )
         public_key = private_key.public_key()
         
-        metadata = KeyMetadata(key_id, owner, "RSA", key_size, purpose)
+        metadata = KeyMetadata(
+            key_id,
+            owner,
+            "RSA",
+            key_size,
+            purpose,
+            private_key_password_protected=bool(private_key_password)
+        )
         self.keys_metadata[key_id] = metadata
         
-        # Mã hóa khóa riêng trước khi lưu
+        # Bảo vệ private key bằng password (nếu có), sau đó tiếp tục mã hóa bằng master key.
+        if private_key_password:
+            pem_encryption = serialization.BestAvailableEncryption(
+                private_key_password.encode('utf-8')
+            )
+        else:
+            pem_encryption = serialization.NoEncryption()
+
         private_pem = private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
+            encryption_algorithm=pem_encryption
         )
         
         public_pem = public_key.public_bytes(
@@ -120,67 +139,70 @@ class KeyStore:
         self._save_private_key(key_id, encrypted_private, metadata)
         self._save_public_key(key_id, public_pem)
         
-        return key_id, f"{key_id}_pub"
+        return key_id, f"{key_id}_pub", private_pem.decode('utf-8')
     
     def _encrypt_key(self, key: bytes) -> bytes:
-        """Mã hóa khóa bằng Master Key"""
-        iv = os.urandom(16)
-        cipher = Cipher(algorithms.AES(self.master_key), modes.CBC(iv), 
-                       backend=default_backend())
+        """Mã hóa khóa bằng Master Key (AES-256-GCM, có xác thực toàn vẹn)"""
+        nonce = os.urandom(12)  # 96-bit nonce cho GCM
+        cipher = Cipher(
+            algorithms.AES(self.master_key),
+            modes.GCM(nonce),
+            backend=default_backend()
+        )
         encryptor = cipher.encryptor()
-        
-        # Padding
-        from cryptography.hazmat.primitives import padding as sym_padding
-        padder = sym_padding.PKCS7(128).padder()
-        padded_key = padder.update(key) + padder.finalize()
-        
-        ciphertext = encryptor.update(padded_key) + encryptor.finalize()
-        return iv + ciphertext
+
+        ciphertext = encryptor.update(key) + encryptor.finalize()
+        tag = encryptor.tag
+
+        # Format: b"GCM1" + nonce(12) + tag(16) + ciphertext
+        return b"GCM1" + nonce + tag + ciphertext
     
     def _decrypt_key(self, encrypted_key: bytes) -> bytes:
-        """Giải mã khóa bằng Master Key"""
+        """Giải mã khóa bằng Master Key.
+
+        Ưu tiên định dạng mới AES-GCM; giữ tương thích ngược với dữ liệu cũ AES-CBC.
+        """
+        if encrypted_key.startswith(b"GCM1"):
+            nonce = encrypted_key[4:16]
+            tag = encrypted_key[16:32]
+            ciphertext = encrypted_key[32:]
+
+            cipher = Cipher(
+                algorithms.AES(self.master_key),
+                modes.GCM(nonce, tag),
+                backend=default_backend()
+            )
+            decryptor = cipher.decryptor()
+            return decryptor.update(ciphertext) + decryptor.finalize()
+
+        # Legacy fallback: AES-CBC + PKCS7
         iv = encrypted_key[:16]
         ciphertext = encrypted_key[16:]
-        
+
         cipher = Cipher(algorithms.AES(self.master_key), modes.CBC(iv),
                        backend=default_backend())
         decryptor = cipher.decryptor()
         padded_key = decryptor.update(ciphertext) + decryptor.finalize()
-        
+
         from cryptography.hazmat.primitives import padding as sym_padding
         unpadder = sym_padding.PKCS7(128).unpadder()
         key = unpadder.update(padded_key) + unpadder.finalize()
-        
+
         return key
     
     def _save_encrypted_key(self, key_id: str, encrypted_key: bytes, metadata: KeyMetadata):
         """Lưu khóa được mã hóa"""
-        key_path = os.path.join(self.storage_path, f"{key_id}.key")
-        with open(key_path, 'wb') as f:
-            f.write(encrypted_key)
-        os.chmod(key_path, 0o600)
-        
-        # Lưu metadata
-        metadata_path = os.path.join(self.storage_path, f"{key_id}.meta")
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata.to_dict(), f, indent=2)
+        self.storage.save_key_bytes(key_id, encrypted_key)
+        self.storage.save_metadata(key_id, metadata.to_dict())
     
     def _save_private_key(self, key_id: str, encrypted_key: bytes, metadata: KeyMetadata):
         """Lưu khóa riêng RSA được mã hóa"""
-        key_path = os.path.join(self.storage_path, f"{key_id}_private.pem")
-        with open(key_path, 'wb') as f:
-            f.write(encrypted_key)
-        os.chmod(key_path, 0o600)
-        
-        metadata_path = os.path.join(self.storage_path, f"{key_id}.meta")
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata.to_dict(), f, indent=2)
+        self.storage.save_private_key_bytes(key_id, encrypted_key)
+        self.storage.save_metadata(key_id, metadata.to_dict())
     
     def _save_public_key(self, key_id: str, public_key: bytes):
         """Lưu khóa công khai RSA"""
-        key_path = os.path.join(self.storage_path, f"{key_id}_public.pem")
-        with open(key_path, 'wb') as f:
-            f.write(public_key)
+        self.storage.save_public_key_bytes(key_id, public_key)
     
     def get_symmetric_key(self, key_id: str) -> Optional[bytes]:
         """Lấy khóa đối xứng"""
@@ -191,16 +213,13 @@ class KeyStore:
         if not metadata or metadata.is_expired():
             raise ValueError(f"Khóa {key_id} hết hạn hoặc không tồn tại")
         
-        key_path = os.path.join(self.storage_path, f"{key_id}.key")
-        if not os.path.exists(key_path):
+        encrypted_key = self.storage.load_key_bytes(key_id)
+        if encrypted_key is None:
             return None
-        
-        with open(key_path, 'rb') as f:
-            encrypted_key = f.read()
         
         return self._decrypt_key(encrypted_key)
     
-    def get_private_key(self, key_id: str):
+    def get_private_key(self, key_id: str, private_key_password: Optional[str] = None):
         """Lấy khóa riêng RSA"""
         if key_id not in self.keys_metadata:
             self._load_metadata(key_id)
@@ -209,35 +228,33 @@ class KeyStore:
         if not metadata or metadata.is_expired():
             raise ValueError(f"Khóa {key_id} hết hạn hoặc không tồn tại")
         
-        key_path = os.path.join(self.storage_path, f"{key_id}_private.pem")
-        if not os.path.exists(key_path):
+        encrypted_key = self.storage.load_private_key_bytes(key_id)
+        if encrypted_key is None:
             return None
         
-        with open(key_path, 'rb') as f:
-            encrypted_key = f.read()
-        
         private_pem = self._decrypt_key(encrypted_key)
+        password_bytes = None
+        if private_key_password is not None:
+            password_bytes = private_key_password.encode('utf-8')
+
         return serialization.load_pem_private_key(
             private_pem,
-            password=None,
+            password=password_bytes,
             backend=default_backend()
         )
     
     def get_public_key(self, key_id: str):
         """Lấy khóa công khai RSA"""
-        key_path = os.path.join(self.storage_path, f"{key_id}_public.pem")
-        if not os.path.exists(key_path):
+        public_pem = self.storage.load_public_key_bytes(key_id)
+        if public_pem is None:
             return None
-        
-        with open(key_path, 'rb') as f:
-            public_pem = f.read()
         
         return serialization.load_pem_public_key(
             public_pem,
             backend=default_backend()
         )
     
-    def rotate_key(self, key_id: str):
+    def rotate_key(self, key_id: str, private_key_password: Optional[str] = None):
         """Xoay vòng khóa (tạo khóa mới, lưu khóa cũ)"""
         if key_id not in self.keys_metadata:
             self._load_metadata(key_id)
@@ -251,8 +268,14 @@ class KeyStore:
         new_key_id = f"{key_id}_v{new_version}"
         
         if metadata.algorithm.startswith("RSA"):
+            if metadata.private_key_password_protected and not private_key_password:
+                raise ValueError(
+                    "Khóa RSA hiện tại dùng password protection. "
+                    "Cần cung cấp private_key_password để rotate và giữ nguyên policy bảo vệ."
+                )
             self.generate_asymmetric_key_pair(new_key_id, metadata.owner, 
-                                              metadata.purpose, metadata.key_size)
+                                              metadata.purpose, metadata.key_size,
+                                              private_key_password=private_key_password)
         else:
             self.generate_symmetric_key(new_key_id, metadata.owner, 
                                        metadata.purpose, metadata.algorithm)
@@ -265,33 +288,30 @@ class KeyStore:
     
     def _load_metadata(self, key_id: str):
         """Tải metadata từ file"""
-        metadata_path = os.path.join(self.storage_path, f"{key_id}.meta")
-        if os.path.exists(metadata_path):
-            with open(metadata_path, 'r') as f:
-                data = json.load(f)
-                metadata = KeyMetadata(
-                    data['key_id'], data['owner'], data['algorithm'],
-                    data['key_size'], data['purpose']
-                )
-                metadata.is_active = data['is_active']
-                metadata.version = data['version']
-                self.keys_metadata[key_id] = metadata
+        data = self.storage.load_metadata(key_id)
+        if data is not None:
+            metadata = KeyMetadata(
+                data['key_id'], data['owner'], data['algorithm'],
+                data['key_size'], data['purpose'],
+                private_key_password_protected=data.get('private_key_password_protected', False)
+            )
+            metadata.is_active = data['is_active']
+            metadata.version = data['version']
+            self.keys_metadata[key_id] = metadata
     
     def list_keys(self, owner: Optional[str] = None) -> list:
         """Liệt kê các khóa"""
         keys = []
-        for filename in os.listdir(self.storage_path):
-            if filename.endswith('.meta'):
-                key_id = filename.replace('.meta', '')
-                if key_id not in self.keys_metadata:
-                    self._load_metadata(key_id)
+        for key_id in self.storage.list_key_ids():
+            if key_id not in self.keys_metadata:
+                self._load_metadata(key_id)
 
-                metadata = self.keys_metadata.get(key_id)
-                if metadata is None:
-                    continue
+            metadata = self.keys_metadata.get(key_id)
+            if metadata is None:
+                continue
 
-                if owner is None or metadata.owner == owner:
-                    keys.append(metadata.to_dict())
+            if owner is None or metadata.owner == owner:
+                keys.append(metadata.to_dict())
         
         return keys
     
@@ -307,6 +327,4 @@ class KeyStore:
         metadata.is_active = False
         
         # Cập nhật metadata
-        metadata_path = os.path.join(self.storage_path, f"{key_id}.meta")
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata.to_dict(), f, indent=2)
+        self.storage.save_metadata(key_id, metadata.to_dict())

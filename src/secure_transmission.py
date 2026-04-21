@@ -28,6 +28,48 @@ class SecureMessage:
         self.algorithm = None
 
 
+import threading
+
+class ReplayProtector:
+    """Bảo vệ chống tấn công Replay bằng cách kiểm tra timestamp và cache nonce"""
+    def __init__(self, time_window_seconds: int = 30):
+        self.time_window = time_window_seconds
+        self.nonce_cache: Dict[str, float] = {}  # nonce -> expire_time
+        self.lock = threading.Lock()
+        
+    def check_replay(self, timestamp_str: Optional[str], nonce: Optional[str]) -> bool:
+        """Kiểm tra timestamp và nonce. Trả về True nếu hợp lệ, False nếu là replay."""
+        if not timestamp_str or not nonce:
+            return False
+            
+        try:
+            msg_time = datetime.fromisoformat(timestamp_str)
+            now = datetime.now()
+            diff = abs((now - msg_time).total_seconds())
+            
+            # Kiểm tra khoảng thời gian hợp lệ (± 30s)
+            if diff > self.time_window:
+                return False
+                
+            current_time = now.timestamp()
+            with self.lock:
+                # Kiểm tra nonce đã tồn tại chưa
+                if nonce in self.nonce_cache:
+                    return False
+                    
+                # Xóa các nonce đã hết hạn để giải phóng bộ nhớ
+                to_delete = [n for n, exp in self.nonce_cache.items() if current_time > exp]
+                for n in to_delete:
+                    del self.nonce_cache[n]
+                    
+                # Lưu nonce mới vào cache (thời gian sống = time window * 2)
+                self.nonce_cache[nonce] = current_time + (self.time_window * 2)
+                
+            return True
+        except Exception:
+            return False
+
+
 class SecureTransmissionChannel:
     """Kênh truyền dữ liệu an toàn"""
     
@@ -87,6 +129,8 @@ class SecureTransmissionChannel:
         Trả về: (nonce_base64, ciphertext_base64, tag_base64)
         """
         nonce = os.urandom(12)  # 96-bit nonce cho GCM
+
+        # Khởi tạo cipher với GCM mode
         cipher = Cipher(
             algorithms.AES(key),
             modes.GCM(nonce),
@@ -94,9 +138,11 @@ class SecureTransmissionChannel:
         )
         encryptor = cipher.encryptor()
         
+        # thêm dữ liệu liên kết (associated data) nếu có
         if associated_data:
             encryptor.authenticate_additional_data(associated_data.encode('utf-8'))
         
+        # mã hóa plaintext
         ciphertext = encryptor.update(plaintext.encode('utf-8')) + encryptor.finalize()
         
         return (
@@ -157,7 +203,7 @@ class SecureTransmissionChannel:
     # ============ Chữ ký số ============
     
     def sign_message(self, message_content: str, private_key) -> str:
-        """Ký thông điệp bằng RSA"""
+        # Ký thông điệp bằng RSA private key user đó
         signature = private_key.sign(
             message_content.encode('utf-8'),
             padding.PSS(

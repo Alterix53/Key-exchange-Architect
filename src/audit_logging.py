@@ -6,8 +6,11 @@ Ghi lại tất cả hoạt động để kiểm tra an toàn
 import json
 import os
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 from enum import Enum
+
+if TYPE_CHECKING:
+    from .storage_backend import AuditStorage
 
 
 class AuditEventType(Enum):
@@ -96,9 +99,14 @@ class AuditLog:
 
 class AuditLogger:
     """Ghi lại kiểm tra"""
-    def __init__(self, log_path: str = "audit_logs"):
+    def __init__(self, log_path: str = "audit_logs", storage: Optional['AuditStorage'] = None):
         self.log_path = log_path
-        os.makedirs(log_path, exist_ok=True)
+        if storage is not None:
+            self.storage = storage
+        else:
+            from .storage_backend import JsonFileAuditStorage
+            self.storage = JsonFileAuditStorage(log_path)
+            
         self.current_logs: List[AuditLog] = []
         self._load_logs()
     
@@ -118,34 +126,24 @@ class AuditLogger:
     
     def _save_log(self, log: AuditLog):
         """Lưu bản ghi"""
-        # Lưu theo ngày
-        date_str = log.timestamp.strftime("%Y-%m-%d")
-        log_file = os.path.join(self.log_path, f"{date_str}_audit.jsonl")
-        
-        with open(log_file, 'a') as f:
-            f.write(json.dumps(log.to_dict()) + '\n')
+        self.storage.save_log(log.to_dict())
     
     def _load_logs(self):
-        """Tải bản ghi từ file"""
-        for filename in os.listdir(self.log_path):
-            if filename.endswith('_audit.jsonl'):
-                log_file = os.path.join(self.log_path, filename)
-                with open(log_file, 'r') as f:
-                    for line in f:
-                        if line.strip():
-                            data = json.loads(line)
-                            log = AuditLog(
-                                AuditEventType(data['event_type']),
-                                data['user_id'],
-                                data['resource'],
-                                data['action'],
-                                data['result'],
-                                data.get('details')
-                            )
-                            log.log_id = data['log_id']
-                            log.ip_address = data['ip_address']
-                            log.user_agent = data['user_agent']
-                            self.current_logs.append(log)
+        """Tải bản ghi từ storage backend"""
+        for data in self.storage.load_all_logs():
+            log = AuditLog(
+                AuditEventType(data['event_type']),
+                data['user_id'],
+                data['resource'],
+                data['action'],
+                data['result'],
+                data.get('details')
+            )
+            log.log_id = data['log_id']
+            log.timestamp = datetime.fromisoformat(data['timestamp'])
+            log.ip_address = data.get('ip_address')
+            log.user_agent = data.get('user_agent')
+            self.current_logs.append(log)
     
     def get_logs_by_user(self, user_id: str,
                         limit: int = 100) -> List[Dict]:
@@ -238,23 +236,10 @@ class AuditLogger:
         """Xuất bản ghi"""
         if output_file is None:
             output_file = os.path.join(self.log_path,
-                                      f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+                                      f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{format}")
         
-        if format == "json":
-            logs_data = [log.to_dict() for log in self.current_logs]
-            with open(output_file, 'w') as f:
-                json.dump(logs_data, f, indent=2, default=str)
-        elif format == "csv":
-            import csv
-            output_file = output_file.replace('.json', '.csv')
-            if self.current_logs:
-                keys = self.current_logs[0].to_dict().keys()
-                with open(output_file, 'w', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=keys)
-                    writer.writeheader()
-                    writer.writerows([log.to_dict() for log in self.current_logs])
-        
-        return output_file
+        logs_data = [log.to_dict() for log in self.current_logs]
+        return self.storage.export_logs(logs_data, format, output_file)
     
     def get_all_logs(self, limit: int = 1000) -> List[Dict]:
         """Lấy tất cả bản ghi"""
