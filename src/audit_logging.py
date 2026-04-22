@@ -104,8 +104,11 @@ class AuditLogger:
         if storage is not None:
             self.storage = storage
         else:
-            from .storage_backend import JsonFileAuditStorage
-            self.storage = JsonFileAuditStorage(log_path)
+            from .db import get_working_connection_string
+            from .storage_backend import SqlServerAuditStorage
+
+            conn_str = get_working_connection_string()
+            self.storage = SqlServerAuditStorage(conn_str)
             
         self.current_logs: List[AuditLog] = []
         self._load_logs()

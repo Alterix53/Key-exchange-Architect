@@ -73,6 +73,7 @@ class RoleBasedAccessControl:
                 Permission("chat", "discover"),
                 Permission("chat", "send"),
                 Permission("chat", "receive"),
+
             },
             Role.GUEST: {
                 Permission("keys", "read_public"),
@@ -195,12 +196,14 @@ class IdentityManagementSystem:
     def __init__(self, storage_path: str = "iam_storage", storage: Optional['UserStorage'] = None):
         self.storage_path = storage_path
         
-        # Storage Backend: mặc định dùng JSON file, có thể thay bằng SQL Server
         if storage is not None:
             self.storage = storage
         else:
-            from .storage_backend import JsonFileUserStorage
-            self.storage = JsonFileUserStorage(storage_path)
+            from .db import get_working_connection_string
+            from .storage_backend import SqlServerUserStorage
+
+            conn_str = get_working_connection_string()
+            self.storage = SqlServerUserStorage(conn_str)
         
         self.users: Dict[str, User] = {}
         self.sessions: Dict[str, Session] = {}
@@ -232,7 +235,7 @@ class IdentityManagementSystem:
         new_hash = self.hash_password(password, salt)
         return new_hash == password_hash
     
-    def create_user(self, username: str, email: str, password: str,
+    def create_user(self, username: str, email: str, password:  str,
                    roles: Optional[List[Role]] = None) -> User:
         """Tạo người dùng mới"""
         if roles is None:

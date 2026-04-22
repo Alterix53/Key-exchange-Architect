@@ -16,25 +16,25 @@ from src.public_key_distribution import CertificateAuthority
 from src.audit_logging import AuditLogger, AuditEventType
 
 
-def clean_environment(db_type="json"):
+def clean_environment():
     """Xóa các thư mục data cũ để làm lại từ đầu"""
     print("🧹 Đang dọn dẹp môi trường cũ...")
-    if db_type == "sqlserver":
-        try:
-            from src.db_setup import get_connection_string
-            import pyodbc
-            conn_str = get_connection_string("IAM_KMS_DB")
-            conn = pyodbc.connect(conn_str, autocommit=True)
-            cursor = conn.cursor()
-            # Xóa sạch dữ liệu các bảng theo thứ tự tránh lỗi khóa ngoại
-            cursor.execute("DELETE FROM AuditLogs")
-            cursor.execute("DELETE FROM KeysData")
-            cursor.execute("DELETE FROM KeysMetadata")
-            cursor.execute("DELETE FROM Users")
-            conn.close()
-            print("  - Đã Delete dữ liệu trong SQL Server (IAM_KMS_DB)")
-        except Exception as e:
-            print(f"  - Lỗi khi dọn dẹp SQL Server: {e}")
+    try:
+        from src.db import get_working_connection_string
+        import pyodbc
+
+        conn_str = get_working_connection_string()
+        conn = pyodbc.connect(conn_str, autocommit=True)
+        cursor = conn.cursor()
+        # Xóa sạch dữ liệu các bảng theo thứ tự tránh lỗi khóa ngoại
+        cursor.execute("DELETE FROM AuditLogs")
+        cursor.execute("DELETE FROM KeysData")
+        cursor.execute("DELETE FROM KeysMetadata")
+        cursor.execute("DELETE FROM Users")
+        conn.close()
+        print("  - Đã xóa dữ liệu trong SQL Server (IAM_KMS_DB)")
+    except Exception as e:
+        print(f"  - Lỗi khi dọn dẹp SQL Server: {e}")
     
     dirs_to_clean = ["demo_identity", "demo_keys", "demo_audit", "data"]
     for d in dirs_to_clean:
@@ -45,24 +45,20 @@ def clean_environment(db_type="json"):
     print("  ✓ Hoàn tất làm sạch.")
 
 
-def setup_demo_environment(db_type="json"):
-    print(f"\n🚀 Bắt đầu khởi tạo dữ liệu mẫu hệ thống IAM MS (Backend: {db_type})...")
+def setup_demo_environment():
+    print("\n🚀 Bắt đầu khởi tạo dữ liệu mẫu hệ thống IAM MS (Backend: sqlserver)...")
 
-    if db_type == "sqlserver":
-        from src.db_setup import get_connection_string
-        from src.storage_backend import SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage
-        conn_str = get_connection_string("IAM_KMS_DB")
-        user_storage = SqlServerUserStorage(conn_str)
-        key_storage = SqlServerKeyStorage(conn_str)
-        audit_storage = SqlServerAuditStorage(conn_str)
-        
-        iam = IdentityManagementSystem("demo_identity", storage=user_storage)
-        key_store = KeyStore("demo_keys", storage=key_storage)
-        audit = AuditLogger("demo_audit", storage=audit_storage)
-    else:
-        iam = IdentityManagementSystem("demo_identity")
-        key_store = KeyStore("demo_keys")
-        audit = AuditLogger("demo_audit")
+    from src.db import get_working_connection_string
+    from src.storage_backend import SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage
+
+    conn_str = get_working_connection_string()
+    user_storage = SqlServerUserStorage(conn_str)
+    key_storage = SqlServerKeyStorage(conn_str)
+    audit_storage = SqlServerAuditStorage(conn_str)
+    
+    iam = IdentityManagementSystem("demo_identity", storage=user_storage)
+    key_store = KeyStore("demo_keys", storage=key_storage)
+    audit = AuditLogger("demo_audit", storage=audit_storage)
 
     # 1. Khởi tạo Admin
     print("\n1️⃣  Đang tạo tài khoản Admin...")
@@ -103,8 +99,7 @@ def setup_demo_environment(db_type="json"):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Clean and initialize IAM DB")
-    parser.add_argument("--db", default="json", choices=["json", "sqlserver"], help="Tùy chọn storage type")
-    args = parser.parse_args()
-    
-    clean_environment(args.db)
-    setup_demo_environment(args.db)
+    parser.parse_args()
+
+    clean_environment()
+    setup_demo_environment()
