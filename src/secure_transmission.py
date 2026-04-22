@@ -13,6 +13,7 @@ from cryptography.hazmat.backends import default_backend
 import os
 import secrets
 from datetime import datetime
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 class SecureMessage:
@@ -343,3 +344,24 @@ class SecureTransmissionChannel:
             logs = [m for m in logs if m['recipient_id'] == recipient_id]
         
         return logs
+
+def encrypt_json_with_key(key: bytes, obj: dict) -> Dict[str, str]:
+    """Encrypt a JSON-serializable object with AES-256-GCM and return dict with base64 fields."""
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    plaintext = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ct = aesgcm.encrypt(nonce, plaintext, associated_data=None)
+    return {
+        "enc": base64.b64encode(ct).decode('utf-8'),
+        "nonce": base64.b64encode(nonce).decode('utf-8'),
+        "alg": "AES-256-GCM"
+    }
+
+
+def decrypt_json_with_key(key: bytes, enc_b64: str, nonce_b64: str) -> dict:
+    """Decrypt base64 ciphertext produced by encrypt_json_with_key and return JSON object."""
+    aesgcm = AESGCM(key)
+    ct = base64.b64decode(enc_b64)
+    nonce = base64.b64decode(nonce_b64)
+    pt = aesgcm.decrypt(nonce, ct, associated_data=None)
+    return json.loads(pt.decode('utf-8'))

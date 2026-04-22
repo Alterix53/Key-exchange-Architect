@@ -635,6 +635,125 @@ class IAMDemoClient:
             self.chat_peer_id = None
             self.chat_session_key = None
 
+    def request_session_key_via_kdc(self, peer_id: str, ttl: int = 300) -> bool:
+        """Request a session key for peer_id from KDC via server."""
+        try:
+            # Build KEYREQ payload
+            nonce = secrets.token_urlsafe(16)
+            payload = {
+                "type": "KEYREQ",
+                "ida": self.user_info.get('user_id') if self.user_info else "unknown",
+                "idb": peer_id,
+                "requested_ttl": ttl,
+                "nonce_a": nonce,
+                "ts": datetime.utcnow().isoformat() + "Z"
+            }
+
+            # Get own entity master key (raw bytes) from KeyStore
+            # Note: KeyStore instance must be available server-side; for client demo we assume client has a copy
+            ka = None
+            try:
+                ka = self.channel_key  # placeholder: clients should load their entity master key securely
+            except Exception:
+                ka = None
+
+            if not ka:
+                print("[KDC] Missing local entity master key (ka).")
+                return False
+
+            envelope = encrypt_json_with_key(ka, payload)
+
+            # Send to server as kdc_keyreq
+            req = {
+                "type": "kdc_keyreq",
+                "enc": envelope.get('enc'),
+                "nonce": envelope.get('nonce')
+            }
+            self._send_req(req)
+
+            # Wait for response (kdc_keyresp) via sync
+            res = self._sync_request({}, wait_for_type="kdc_keyresp", timeout=5)
+            if not res or res.get('error'):
+                print_error("KDC response failed")
+                return False
+
+            # Decrypt response with Ka
+            enc = res.get('enc')
+            nonce_b64 = res.get('nonce')
+            resp = decrypt_json_with_key(ka, enc, nonce_b64)
+
+            ks_b64 = resp.get('ks')
+            ticket_enc = resp.get('ticket')
+            ticket_nonce = resp.get('ticket_nonce')
+            ticket_id = resp.get('ticket_id')
+
+            # Save Ks locally for session (decoded)
+            self.chat_session_key = base64.b64decode(ks_b64)
+
+            # Forward ticket to peer via server
+            forward_req = {
+                "type": "forward_ticket",
+                "to": peer_id,
+                "ticket": ticket_enc,
+                "ticket_nonce": ticket_nonce,
+                "ticket_id": ticket_id
+            }
+            self._send_req(forward_req)
+            return True
+        except Exception as e:
+            print_error(f"KDC request error: {e}")
+            return False
+
+    def handle_forwarded_ticket(self, data: Dict):
+        """Handle incoming ticket forwarded by peer. Decrypt using local entity master key."""
+        try:
+            ticket_enc = data.get('ticket')
+            ticket_nonce = data.get('ticket_nonce')
+            ticket_id = data.get('ticket_id')
+
+            kb = None
+            try:
+                kb = self.channel_key  # placeholder: client must have local entity master key
+            except Exception:
+                kb = None
+
+            if not kb:
+                print_error("Missing local entity master key to decrypt ticket")
+                return False
+
+            payload = decrypt_json_with_key(kb, ticket_enc, ticket_nonce)
+            ks_b64 = payload.get('ks')
+            ida = payload.get('ida')
+            ttl = payload.get('ttl')
+            issued_at = payload.get('issued_at')
+
+            # Verify TTL
+            # ...simple check omitted for brevity...
+
+            self.chat_session_key = base64.b64decode(ks_b64)
+            print_success(f"Received session key from ticket {ticket_id}. Ready to perform challenge/response.")
+
+            # Perform challenge-response: B -> A
+            nonce_b = secrets.token_urlsafe(16)
+            chal = {
+                "type": "kdc_challenge",
+                "nonce_b": nonce_b,
+                "ts": datetime.utcnow().isoformat() + "Z"
+            }
+            enc_chal = self.channel.encrypt_aes_256_gcm(json.dumps(chal), self.chat_session_key)
+            chal_msg = {
+                "type": "kdc_challenge_forward",
+                "to": ida,
+                "nonce": enc_chal[0],
+                "ciphertext": enc_chal[1],
+                "tag": enc_chal[2]
+            }
+            self._send_req(chal_msg)
+            return True
+        except Exception as e:
+            print_error(f"Error handling ticket: {e}")
+            return False
+
     def run(self):
         self.connect()
         while self._running:

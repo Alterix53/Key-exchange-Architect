@@ -25,6 +25,7 @@ from src.key_management import KeyStore
 from src.audit_logging import AuditLogger, AuditEventType
 from src.public_key_distribution import CertificateAuthority
 from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
+from src.kdc import KDC
 
 def send_json(sock: socket.socket, payload: Dict) -> None:
     try:
@@ -116,6 +117,15 @@ class IAMBackendServer:
         
         # Cho E2E Chat
         self.active_users: Dict[str, ClientConnection] = {} # user_id -> ClientConnection
+
+        # Initialize KDC when key_store available
+        try:
+            if hasattr(self, 'key_store') and self.key_store is not None:
+                self.kdc = KDC(self.key_store)
+            else:
+                self.kdc = None
+        except Exception:
+            self.kdc = None
 
     # ------------- [CORE: SESSIONS & AUTH] -------------
 
@@ -333,6 +343,48 @@ class IAMBackendServer:
             conn.send(res_payload)
         except Exception as e:
             conn.send({"type": "error", "message": str(e)})
+
+    def process_kdc_keyreq(self, requester_id: str, enc_b64: str, nonce_b64: str) -> Dict[str, Any]:
+        """Process a KDC KEYREQ from requester_id. Returns envelope dict or error."""
+        if not self.kdc:
+            return {"error": "KDC not initialized"}
+
+        # Decrypt and parse KEYREQ
+        payload = self.kdc.decrypt_keyreq(requester_id, enc_b64, nonce_b64)
+        if not payload:
+            return {"error": "Invalid KEYREQ or cannot decrypt"}
+
+        idb = payload.get('idb')
+        requested_ttl = int(payload.get('requested_ttl', 300))
+
+        envelope = self.kdc.issue_session_ticket(requester_id, idb, requested_ttl)
+        if not envelope:
+            return {"error": "Failed to issue ticket"}
+
+        # Return envelope (contains enc/nonce) to be sent back to requester
+        return {"type": "kdc_keyresp", "enc": envelope.get('enc'), "nonce": envelope.get('nonce'), "alg": envelope.get('alg')}
+
+    def process_forward_ticket(self, sender_id: str, recipient_id: str, ticket_enc: str, ticket_nonce: str, ticket_id: str) -> Dict[str, Any]:
+        """Process a forwarded ticket: validate and (optionally) relay. Returns status."""
+        if not self.kdc:
+            return {"error": "KDC not initialized"}
+
+        # Validate ticket record on server-side
+        if not self.kdc.validate_ticket(ticket_id):
+            return {"error": "Ticket invalid or expired/used"}
+
+        # Optionally mark as used now or wait until B confirms
+        # Here we do not mark used yet; B should confirm after successful handshake
+
+        # Prepare relay envelope for recipient (server simply wraps data for relay)
+        relay = {
+            "type": "forward_ticket",
+            "from": sender_id,
+            "ticket": ticket_enc,
+            "ticket_nonce": ticket_nonce,
+            "ticket_id": ticket_id
+        }
+        return relay
 
     # ------------- [E2E RELAY ROUTING] -------------
 

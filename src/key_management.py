@@ -141,6 +141,25 @@ class KeyStore:
         
         return key_id, f"{key_id}_pub", private_pem.decode('utf-8')
     
+    def generate_entity_master_key(self, entity_id: str, ttl_days: int = 365) -> str:
+        """Generate and store a per-entity master key (wrapped by KMS master_key).
+        Stored key_id format: entity_{entity_id}_master
+        Returns the key_id."""
+        key = secrets.token_bytes(32)  # 256-bit entity master key
+        key_id = f"entity_{entity_id}_master"
+        # create metadata with purpose 'kdc_master'
+        metadata = KeyMetadata(key_id, entity_id, "SYMMETRIC", 256, "kdc_master", expiry_days=ttl_days)
+        self.keys_metadata[key_id] = metadata
+
+        # Wrap with existing master_key and persist
+        encrypted_key = self._encrypt_key(key)
+        self._save_encrypted_key(key_id, encrypted_key, metadata)
+
+        return key_id
+
+    def _entity_key_id(self, entity_id: str) -> str:
+        return f"entity_{entity_id}_master"
+
     def _encrypt_key(self, key: bytes) -> bytes:
         """Mã hóa khóa bằng Master Key (AES-256-GCM, có xác thực toàn vẹn)"""
         nonce = os.urandom(12)  # 96-bit nonce cho GCM
@@ -254,6 +273,51 @@ class KeyStore:
             backend=default_backend()
         )
     
+    def get_entity_master_key(self, entity_id: str) -> Optional[bytes]:
+        """Retrieve and unwrap the entity master key. Raises if expired or inactive."""
+        key_id = self._entity_key_id(entity_id)
+        if key_id not in self.keys_metadata:
+            self._load_metadata(key_id)
+
+        metadata = self.keys_metadata.get(key_id)
+        if not metadata or metadata.is_expired() or not metadata.is_active:
+            raise ValueError(f"Entity master key for {entity_id} expired or inactive")
+
+        encrypted_key = self.storage.load_key_bytes(key_id)
+        if encrypted_key is None:
+            return None
+
+        return self._decrypt_key(encrypted_key)
+
+    def rotate_entity_master_key(self, entity_id: str) -> str:
+        """Rotate an entity master key: create a new key id and mark old as inactive."""
+        old_key_id = self._entity_key_id(entity_id)
+        if old_key_id not in self.keys_metadata:
+            self._load_metadata(old_key_id)
+
+        metadata = self.keys_metadata.get(old_key_id)
+        if not metadata:
+            raise ValueError("No existing master key for entity")
+
+        new_version = metadata.version + 1
+        new_key_id = f"{old_key_id}_v{new_version}"
+
+        new_key = secrets.token_bytes(32)
+        # preserve original expiry duration
+        expiry_days = (metadata.expires_at - metadata.created_at).days
+        new_metadata = KeyMetadata(new_key_id, entity_id, "SYMMETRIC", 256, "kdc_master", expiry_days=expiry_days)
+        self.keys_metadata[new_key_id] = new_metadata
+
+        encrypted_key = self._encrypt_key(new_key)
+        self._save_encrypted_key(new_key_id, encrypted_key, new_metadata)
+
+        # deactivate old key and persist metadata
+        metadata.is_active = False
+        metadata.last_rotated = datetime.now()
+        self.storage.save_metadata(old_key_id, metadata.to_dict())
+
+        return new_key_id
+
     def rotate_key(self, key_id: str, private_key_password: Optional[str] = None):
         """Xoay vòng khóa (tạo khóa mới, lưu khóa cũ)"""
         if key_id not in self.keys_metadata:
@@ -286,34 +350,18 @@ class KeyStore:
         
         return new_key_id
     
-    def _load_metadata(self, key_id: str):
-        """Tải metadata từ file"""
-        data = self.storage.load_metadata(key_id)
-        if data is not None:
-            metadata = KeyMetadata(
-                data['key_id'], data['owner'], data['algorithm'],
-                data['key_size'], data['purpose'],
-                private_key_password_protected=data.get('private_key_password_protected', False)
-            )
-            metadata.is_active = data['is_active']
-            metadata.version = data['version']
-            self.keys_metadata[key_id] = metadata
-    
-    def list_keys(self, owner: Optional[str] = None) -> list:
-        """Liệt kê các khóa"""
-        keys = []
-        for key_id in self.storage.list_key_ids():
-            if key_id not in self.keys_metadata:
-                self._load_metadata(key_id)
+    def revoke_entity_master_key(self, entity_id: str) -> None:
+        """Mark the entity master key as revoked/inactive."""
+        key_id = self._entity_key_id(entity_id)
+        if key_id not in self.keys_metadata:
+            self._load_metadata(key_id)
 
-            metadata = self.keys_metadata.get(key_id)
-            if metadata is None:
-                continue
+        metadata = self.keys_metadata.get(key_id)
+        if not metadata:
+            raise ValueError("No existing master key for entity")
 
-            if owner is None or metadata.owner == owner:
-                keys.append(metadata.to_dict())
-        
-        return keys
+        metadata.is_active = False
+        self.storage.save_metadata(key_id, metadata.to_dict())
     
     def revoke_key(self, key_id: str):
         """Thu hồi khóa"""
