@@ -21,7 +21,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
 from src.public_key_distribution import verify_certificate, extract_public_key
 from src.kdc import KDC
-from .secure_transmission import encrypt_json_with_key, decrypt_json_with_key
+from src.secure_transmission import encrypt_json_with_key, decrypt_json_with_key
 
 
 # ANSI Colors
