@@ -3,15 +3,12 @@ demo_encryption/
 demo_key_rotation/
 demo_keys/
 demo_identity/
-demo_pki_data/
-data/
 src/__pycache__/
 tests/__pycache__/
-__pycache__/
 *.log
 *.tmp
 *.bak
 .venv/
 Architect.pdf
-*.pem
-*.crl
+data/
+src/db/__pycache__/
