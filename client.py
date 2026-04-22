@@ -411,12 +411,12 @@ class IAMDemoClient:
             print(f"\n{Colors.HEADER}╔══════════════════════════════════════════╗")
             print(f"║  Xin chào, {username}! (Role: {role_str})")
             print(f"╠══════════════════════════════════════════╣{Colors.ENDC}")
-            print("  1. 🔑 Quản lý khóa (Key Management)")
-            print("  2. 📜 Xem chứng chỉ (Certificate)")
-            print("  3. 📋 Xem audit log")
-            print("  4. 👥 Xem danh sách users")
-            print("  5. 💬 Chế độ chat mã hóa E2E")
-            print("  0. 🚪 Đăng xuất")
+            print("  1. Quản lý khóa (Key Management)")
+            print("  2. Xem chứng chỉ (Certificate)")
+            print("  3. Xem audit log")
+            print("  4. Xem danh sách users")
+            print("  5. Chế độ chat mã hóa E2E")
+            print("  0. Đăng xuất")
             print(f"{Colors.HEADER}╚══════════════════════════════════════════╝{Colors.ENDC}")
             
             choice = input("\nChọn chức năng: ")
@@ -554,7 +554,7 @@ class IAMDemoClient:
         print_header("Chế độ Chat Mã hóa E2E")
         self.do_chat_directory() # Show danh bạ thu gọn
 
-        target_uid = input("\nNhập User ID muốn chat: ").strip()
+        target_uid = input("\nNhập Username (ưu tiên) hoặc User ID muốn chat: ").strip()
         if not target_uid:
             return
             
@@ -568,12 +568,13 @@ class IAMDemoClient:
         if not res:
             return
             
+        resolved_target_id = res.get("target_id", target_uid)
         cert = res.get("certificate")
         if not self.ca_public_key_pem:
             print_error("Thiếu public key của CA để xác minh!")
             return
             
-        is_valid = verify_certificate(cert, self.ca_public_key_pem, expected_subject=target_uid)
+        is_valid = verify_certificate(cert, self.ca_public_key_pem, expected_subject=resolved_target_id)
         if not is_valid:
             print_error("Certificate KHÔNG HỢP LỆ! Dừng kết nối.")
             return
@@ -597,14 +598,14 @@ class IAMDemoClient:
         self._send_req({
             "type": "relay",
             "relay_type": "session_key",
-            "target_id": target_uid,
+            "target_id": resolved_target_id,
             "encrypted_key": encrypted_key,
             "signature": signature
         })
         print_success("Đã gửi Session Key. Sẵn sàng chat!")
         
         self.in_chat_mode = True
-        self.chat_peer_id = target_uid
+        self.chat_peer_id = resolved_target_id
         
         print(f"\n{Colors.WARNING}--- Bắt đầu Chat (gõ 'back' để thoát) ---{Colors.ENDC}")
         try:

@@ -63,8 +63,11 @@ class KeyStore:
         if storage is not None:
             self.storage = storage
         else:
-            from .storage_backend import JsonFileKeyStorage
-            self.storage = JsonFileKeyStorage(storage_path)
+            from .db import get_working_connection_string
+            from .storage_backend import SqlServerKeyStorage
+
+            conn_str = get_working_connection_string()
+            self.storage = SqlServerKeyStorage(conn_str)
             
         self.keys_metadata: Dict[str, KeyMetadata] = {}
         self.master_key = self._load_or_create_master_key()

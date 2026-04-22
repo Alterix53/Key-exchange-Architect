@@ -1,20 +1,18 @@
 """
 Storage Backend Abstraction Layer
-Cung cấp interface trừu tượng để hoán đổi storage backend (JSON File ↔ SQL Server).
+Cung cấp interface trừu tượng để hoán đổi storage backend.
 
 Kiến trúc Repository Pattern:
     BusinessLogic (IdentityManagementSystem, KeyStore, AuditLogger)
         │
         ▼  gọi qua interface
     StorageBackend (ABC)
-        ├── JsonFile*Storage   ← Hiện tại (demo, file system)
-        └── SqlServer*Storage  ← Tương lai (production, SQL Server)
+        └── SqlServer*Storage  ← Backend đang dùng
 """
 
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 import json
-import os
 import secrets
 
 
@@ -112,164 +110,6 @@ class AuditStorage(ABC):
     def export_logs(self, logs: List[Dict], fmt: str, output_file: str) -> str:
         """Xuất bản ghi ra file, trả về đường dẫn file đã xuất"""
         pass
-
-
-# ============================================================
-#  JSON File Implementations — Dùng cho Demo (file system)
-# ============================================================
-
-class JsonFileUserStorage(UserStorage):
-    """Lưu trữ người dùng bằng JSON file — mỗi user một file riêng"""
-
-    def __init__(self, storage_path: str):
-        self.storage_path = storage_path
-        os.makedirs(storage_path, exist_ok=True)
-
-    def save_user(self, user_dict: Dict) -> None:
-        user_path = os.path.join(self.storage_path, f"{user_dict['user_id']}.json")
-        with open(user_path, 'w', encoding='utf-8') as f:
-            json.dump(user_dict, f, indent=2, ensure_ascii=False)
-
-    def load_all_users(self) -> List[Dict]:
-        users = []
-        for filename in os.listdir(self.storage_path):
-            if filename.endswith('.json'):
-                user_path = os.path.join(self.storage_path, filename)
-                with open(user_path, 'r', encoding='utf-8') as f:
-                    users.append(json.load(f))
-        return users
-
-    def delete_user(self, user_id: str) -> None:
-        user_path = os.path.join(self.storage_path, f"{user_id}.json")
-        if os.path.exists(user_path):
-            os.remove(user_path)
-
-
-class JsonFileKeyStorage(KeyStorage):
-    """Lưu trữ khóa bằng file — .key, .meta, .pem"""
-
-    def __init__(self, storage_path: str):
-        self.storage_path = storage_path
-        os.makedirs(storage_path, exist_ok=True)
-
-    def load_or_create_master_key(self) -> bytes:
-        master_key_path = os.path.join(self.storage_path, "master.key")
-        if os.path.exists(master_key_path):
-            with open(master_key_path, 'rb') as f:
-                return f.read()
-        else:
-            master_key = secrets.token_bytes(32)  # 256-bit key
-            with open(master_key_path, 'wb') as f:
-                f.write(master_key)
-            try:
-                os.chmod(master_key_path, 0o600)
-            except OSError:
-                pass  # Windows không hỗ trợ đầy đủ Unix permissions
-            return master_key
-
-    def save_key_bytes(self, key_id: str, data: bytes) -> None:
-        key_path = os.path.join(self.storage_path, f"{key_id}.key")
-        with open(key_path, 'wb') as f:
-            f.write(data)
-        try:
-            os.chmod(key_path, 0o600)
-        except OSError:
-            pass
-
-    def load_key_bytes(self, key_id: str) -> Optional[bytes]:
-        key_path = os.path.join(self.storage_path, f"{key_id}.key")
-        if not os.path.exists(key_path):
-            return None
-        with open(key_path, 'rb') as f:
-            return f.read()
-
-    def save_private_key_bytes(self, key_id: str, data: bytes) -> None:
-        key_path = os.path.join(self.storage_path, f"{key_id}_private.pem")
-        with open(key_path, 'wb') as f:
-            f.write(data)
-        try:
-            os.chmod(key_path, 0o600)
-        except OSError:
-            pass
-
-    def load_private_key_bytes(self, key_id: str) -> Optional[bytes]:
-        key_path = os.path.join(self.storage_path, f"{key_id}_private.pem")
-        if not os.path.exists(key_path):
-            return None
-        with open(key_path, 'rb') as f:
-            return f.read()
-
-    def save_public_key_bytes(self, key_id: str, data: bytes) -> None:
-        key_path = os.path.join(self.storage_path, f"{key_id}_public.pem")
-        with open(key_path, 'wb') as f:
-            f.write(data)
-
-    def load_public_key_bytes(self, key_id: str) -> Optional[bytes]:
-        key_path = os.path.join(self.storage_path, f"{key_id}_public.pem")
-        if not os.path.exists(key_path):
-            return None
-        with open(key_path, 'rb') as f:
-            return f.read()
-
-    def save_metadata(self, key_id: str, metadata_dict: Dict) -> None:
-        metadata_path = os.path.join(self.storage_path, f"{key_id}.meta")
-        with open(metadata_path, 'w', encoding='utf-8') as f:
-            json.dump(metadata_dict, f, indent=2)
-
-    def load_metadata(self, key_id: str) -> Optional[Dict]:
-        metadata_path = os.path.join(self.storage_path, f"{key_id}.meta")
-        if not os.path.exists(metadata_path):
-            return None
-        with open(metadata_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-
-    def list_key_ids(self) -> List[str]:
-        ids = []
-        for filename in os.listdir(self.storage_path):
-            if filename.endswith('.meta'):
-                ids.append(filename.replace('.meta', ''))
-        return ids
-
-
-class JsonFileAuditStorage(AuditStorage):
-    """Lưu trữ audit log bằng JSONL file — mỗi ngày một file"""
-
-    def __init__(self, log_path: str):
-        self.log_path = log_path
-        os.makedirs(log_path, exist_ok=True)
-
-    def save_log(self, log_dict: Dict) -> None:
-        timestamp = log_dict.get('timestamp', '')
-        date_str = timestamp[:10]  # YYYY-MM-DD
-        log_file = os.path.join(self.log_path, f"{date_str}_audit.jsonl")
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(log_dict, ensure_ascii=False) + '\n')
-
-    def load_all_logs(self) -> List[Dict]:
-        logs = []
-        for filename in sorted(os.listdir(self.log_path)):
-            if filename.endswith('_audit.jsonl'):
-                log_file = os.path.join(self.log_path, filename)
-                with open(log_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        if line.strip():
-                            logs.append(json.loads(line))
-        return logs
-
-    def export_logs(self, logs: List[Dict], fmt: str, output_file: str) -> str:
-        if fmt == "json":
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(logs, f, indent=2, default=str, ensure_ascii=False)
-        elif fmt == "csv":
-            import csv
-            output_file = output_file.replace('.json', '.csv')
-            if logs:
-                keys = logs[0].keys()
-                with open(output_file, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=keys)
-                    writer.writeheader()
-                    writer.writerows(logs)
-        return output_file
 
 
 # ============================================================

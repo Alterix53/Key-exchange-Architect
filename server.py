@@ -53,28 +53,23 @@ class ClientConnection:
             send_json(self.sock, payload)
 
 class IAMBackendServer:
-    def __init__(self, host: str, port: int, db_type: str = "json"):
+    def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
         
         # 1. Khởi tạo IAM Modules
-        print(f"[INIT] Đang tải các phân hệ IAM (Backend: {db_type})...")
-        
-        if db_type == "sqlserver":
-            from src.db_setup import get_connection_string
-            from src.storage_backend import SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage
-            conn_str = get_connection_string("IAM_KMS_DB")
-            user_storage = SqlServerUserStorage(conn_str)
-            key_storage = SqlServerKeyStorage(conn_str)
-            audit_storage = SqlServerAuditStorage(conn_str)
-            
-            self.iam = IdentityManagementSystem("demo_identity", storage=user_storage)
-            self.key_store = KeyStore("demo_keys", storage=key_storage)
-            self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
-        else:
-            self.iam = IdentityManagementSystem("demo_identity")
-            self.key_store = KeyStore("demo_keys")
-            self.audit_logger = AuditLogger("demo_audit")
+        print("[INIT] Đang tải các phân hệ IAM (Backend: sqlserver)...")
+
+        from src.db import get_working_connection_string
+        from src.storage_backend import SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage
+        conn_str = get_working_connection_string()
+        user_storage = SqlServerUserStorage(conn_str)
+        key_storage = SqlServerKeyStorage(conn_str)
+        audit_storage = SqlServerAuditStorage(conn_str)
+
+        self.iam = IdentityManagementSystem("demo_identity", storage=user_storage)
+        self.key_store = KeyStore("demo_keys", storage=key_storage)
+        self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
             
         self.ca = CertificateAuthority(data_dir="data")
         
@@ -388,6 +383,32 @@ class IAMBackendServer:
 
     # ------------- [E2E RELAY ROUTING] -------------
 
+    def _resolve_target_user_id(self, target_ref: Any) -> Optional[str]:
+        """Resolve target reference to canonical user_id, ưu tiên username trước."""
+        if target_ref is None:
+            return None
+
+        target = str(target_ref).strip()
+        if not target:
+            return None
+
+        target_lower = target.lower()
+
+        # Ưu tiên username để nhập liệu thân thiện cho người dùng
+        for uid, user in self.iam.users.items():
+            if user.username.lower() == target_lower:
+                return str(uid)
+
+        if target in self.iam.users:
+            return target
+
+        for uid, user in self.iam.users.items():
+            uid_str = str(uid)
+            if uid_str.lower() == target_lower:
+                return uid_str
+
+        return None
+
     def handle_relay(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
         """Trung chuyển gói tin E2E: chat, cert_request (để chat), session_key"""
         target_id = req.get("target_id")
@@ -395,36 +416,43 @@ class IAMBackendServer:
         
         if not target_id:
             return
-            
-        if target_id not in self.active_users:
+
+        resolved_target_id = self._resolve_target_user_id(target_id)
+        if not resolved_target_id:
+            conn.send({"type": "error", "message": f"Target user '{target_id}' does not exist"})
+            return
+
+        with self.clients_lock:
+            target_conn = self.active_users.get(resolved_target_id)
+
+        if not target_conn:
             conn.send({"type": "error", "message": "Target user is completely offline"})
             return
-            
-        target_conn = self.active_users[target_id]
         
         # E2E - Client muốn lấy cert của ng khác để chat
         if relay_type == "get_cert":
-            target_cert = self.ca.get_certificate(target_id)
+            target_cert = self.ca.get_certificate(resolved_target_id)
             if target_cert:
-                conn.send({"type": "peer_cert_response", "target_id": target_id, "certificate": target_cert})
+                conn.send({"type": "peer_cert_response", "target_id": resolved_target_id, "certificate": target_cert})
             else:
-                conn.send({"type": "error", "message": f"Certificate for {target_id} not found"})
+                conn.send({"type": "error", "message": f"Certificate for {resolved_target_id} not found"})
         
         # E2E - Gửi Session Key
         elif relay_type == "session_key":
             req["type"] = "peer_session_key"
             req["sender_id"] = user_id
             req["sender_cert"] = self.ca.get_certificate(user_id)
+            req["target_id"] = resolved_target_id
             del req["relay_type"]
             target_conn.send(req)
             
         # E2E - Chat Message
         elif relay_type == "chat_msg":
-            self.audit_logger.log_event(AuditEventType.MESSAGE_RECEIVED, user_id, "backend", "relay", "success", details={"to": target_id})
+            self.audit_logger.log_event(AuditEventType.MESSAGE_RECEIVED, user_id, "backend", "relay", "success", details={"to": resolved_target_id})
             payload = {
                 "type": "relayed_chat_msg",
                 "sender_id": user_id,
-                "target_id": target_id,
+                "target_id": resolved_target_id,
                 "algorithm": req.get("algorithm"),
                 "nonce": req.get("nonce"),
                 "ciphertext": req.get("ciphertext"),
@@ -541,10 +569,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IAM Backend Server")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind")
     parser.add_argument("--port", type=int, default=5000, help="Port to bind")
-    parser.add_argument("--db", default="json", choices=["json", "sqlserver"], help="Database backend to use")
     args = parser.parse_args()
 
-    server = IAMBackendServer(args.host, args.port, args.db)
+    server = IAMBackendServer(args.host, args.port)
     try:
         server.start()
     except KeyboardInterrupt:
