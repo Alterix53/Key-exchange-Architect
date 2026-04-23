@@ -10,6 +10,7 @@ import socket
 import threading
 import os
 import sys
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Optional, List
@@ -24,6 +25,7 @@ from src.key_management import KeyStore
 from src.audit_logging import AuditLogger, AuditEventType
 from src.public_key_distribution import CertificateAuthority
 from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
+from src.kdc import KDC
 
 def send_json(sock: socket.socket, payload: Dict) -> None:
     try:
@@ -38,6 +40,7 @@ class ClientConnection:
     file_reader: Any
     session_id: Optional[str] = None
     user_id: Optional[str] = None
+    server_nonce: Optional[str] = None
     write_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def send(self, payload: Dict) -> None:
@@ -68,7 +71,39 @@ class IAMBackendServer:
         self.key_store = KeyStore("demo_keys", storage=key_storage)
         self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
             
-        self.ca = CertificateAuthority(data_dir="pki")
+        self.ca = CertificateAuthority(data_dir="data")
+        
+        # --- MUTUAL AUTH: Khởi tạo Server Identity ---
+        server_priv_path = "data/server_private.pem"
+        server_cert_path = "data/server_cert.pem"
+        
+        if os.path.exists(server_priv_path) and os.path.exists(server_cert_path):
+            with open(server_priv_path, "rb") as f:
+                self.server_private_key = serialization.load_pem_private_key(f.read(), password=None)
+            with open(server_cert_path, "r", encoding="utf-8") as f:
+                self.server_cert_pem = f.read()
+            print("[SERVER] Đã tải Server Certificate từ file.")
+        else:
+            print("[SERVER] Khởi tạo Server Identity mới...")
+            self.server_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            with open(server_priv_path, "wb") as f:
+                f.write(self.server_private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+            server_pub_pem = self.server_private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            ).decode("utf-8")
+            
+            # Yêu cầu CA cấp chứng chỉ với Subject là IAM-Server
+            self.server_cert_pem = self.ca.issue_certificate("IAM-Server", server_pub_pem)
+            with open(server_cert_path, "w", encoding="utf-8") as f:
+                f.write(self.server_cert_pem)
+            print("[SERVER] Đã tạo và cấp Server Certificate mới (IAM-Server).")
+        # --- END MUTUAL AUTH ---
+        
         self.channel = SecureTransmissionChannel()
         self.replay_protector = ReplayProtector(time_window_seconds=30)
         
@@ -77,6 +112,15 @@ class IAMBackendServer:
         
         # Cho E2E Chat
         self.active_users: Dict[str, ClientConnection] = {} # user_id -> ClientConnection
+
+        # Initialize KDC when key_store available
+        try:
+            if hasattr(self, 'key_store') and self.key_store is not None:
+                self.kdc = KDC(self.key_store)
+            else:
+                self.kdc = None
+        except Exception:
+            self.kdc = None
 
     # ------------- [CORE: SESSIONS & AUTH] -------------
 
@@ -122,20 +166,45 @@ class IAMBackendServer:
         """Xử lý đăng nhập"""
         username = req.get("username", "")
         password = req.get("password", "")
+        client_public_key_pem = req.get("client_public_key")
+        client_nonce = req.get("client_nonce")
+        client_proof = req.get("client_proof")
         
         session = self.iam.authenticate_user(username, password, ip)
         if session:
+            if not client_public_key_pem or not client_nonce or not client_proof or not conn.server_nonce:
+                conn.send({"type": "error", "message": "Mutual auth failed: missing client proof material"})
+                return
+
+            try:
+                client_public_key = serialization.load_pem_public_key(client_public_key_pem.encode("utf-8"))
+            except Exception:
+                conn.send({"type": "error", "message": "Mutual auth failed: invalid client public key"})
+                return
+
+            proof_message = f"{conn.server_nonce}|{client_nonce}|{username}"
+            if not self.channel.verify_signature(proof_message, client_proof, client_public_key):
+                conn.send({"type": "error", "message": "Mutual auth failed: invalid client proof"})
+                return
+
             self.audit_logger.log_event(AuditEventType.USER_LOGIN, session.user_id, "backend", "login", "success", ip_address=ip)
             user_info = self.iam.users[session.user_id].to_dict()
             with self.clients_lock:
                 conn.session_id = session.session_id
                 conn.user_id = session.user_id
                 self.active_users[session.user_id] = conn
+
+            server_auth_proof = self.channel.sign_message(
+                f"{session.session_id}|{client_nonce}|login_ok",
+                self.server_private_key
+            )
                 
             conn.send({
                 "type": "login_ok",
                 "session_id": session.session_id,
-                "user": user_info
+                "user": user_info,
+                "server_auth_proof": server_auth_proof,
+                "server_cert": self.server_cert_pem
             })
         else:
             self.audit_logger.log_event(AuditEventType.USER_FAILED_LOGIN, username, "backend", "login", "failed", ip_address=ip)
@@ -270,6 +339,48 @@ class IAMBackendServer:
         except Exception as e:
             conn.send({"type": "error", "message": str(e)})
 
+    def process_kdc_keyreq(self, requester_id: str, enc_b64: str, nonce_b64: str) -> Dict[str, Any]:
+        """Process a KDC KEYREQ from requester_id. Returns envelope dict or error."""
+        if not self.kdc:
+            return {"error": "KDC not initialized"}
+
+        # Decrypt and parse KEYREQ
+        payload = self.kdc.decrypt_keyreq(requester_id, enc_b64, nonce_b64)
+        if not payload:
+            return {"error": "Invalid KEYREQ or cannot decrypt"}
+
+        idb = payload.get('idb')
+        requested_ttl = int(payload.get('requested_ttl', 300))
+
+        envelope = self.kdc.issue_session_ticket(requester_id, idb, requested_ttl)
+        if not envelope:
+            return {"error": "Failed to issue ticket"}
+
+        # Return envelope (contains enc/nonce) to be sent back to requester
+        return {"type": "kdc_keyresp", "enc": envelope.get('enc'), "nonce": envelope.get('nonce'), "alg": envelope.get('alg')}
+
+    def process_forward_ticket(self, sender_id: str, recipient_id: str, ticket_enc: str, ticket_nonce: str, ticket_id: str) -> Dict[str, Any]:
+        """Process a forwarded ticket: validate and (optionally) relay. Returns status."""
+        if not self.kdc:
+            return {"error": "KDC not initialized"}
+
+        # Validate ticket record on server-side
+        if not self.kdc.validate_ticket(ticket_id):
+            return {"error": "Ticket invalid or expired/used"}
+
+        # Optionally mark as used now or wait until B confirms
+        # Here we do not mark used yet; B should confirm after successful handshake
+
+        # Prepare relay envelope for recipient (server simply wraps data for relay)
+        relay = {
+            "type": "forward_ticket",
+            "from": sender_id,
+            "ticket": ticket_enc,
+            "ticket_nonce": ticket_nonce,
+            "ticket_id": ticket_id
+        }
+        return relay
+
     # ------------- [E2E RELAY ROUTING] -------------
 
     def _resolve_target_user_id(self, target_ref: Any) -> Optional[str]:
@@ -359,8 +470,17 @@ class IAMBackendServer:
             self.clients[client_sock] = conn
             
         # Send Welcome JSON
+        # --- MUTUAL AUTH: Send Server Certificate ---
+        conn.server_nonce = secrets.token_urlsafe(24)
+        server_hello_signature = self.channel.sign_message(
+            f"{conn.server_nonce}|IAM-Server",
+            self.server_private_key
+        )
         conn.send({
-            "type": "welcome", 
+            "type": "server_hello", 
+            "certificate": self.server_cert_pem,
+            "server_nonce": conn.server_nonce,
+            "server_signature": server_hello_signature,
             "message": "Connected to IAM Backend Server. Please login or register."
         })
         
