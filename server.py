@@ -63,11 +63,16 @@ class IAMBackendServer:
         self.port = port
         
         # 1. Khởi tạo IAM Modules
+
+        
+        # Khởi tạo storage và các hệ thống IAM với storage backend SQL Server
+        # lưu dữ liệu trong sql
         print("[INIT] Đang tải các phân hệ IAM (Backend: sqlserver)...")
 
         from src.db import get_working_connection_string
         from src.storage_backend import SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage
         conn_str = get_working_connection_string()
+
         user_storage = SqlServerUserStorage(conn_str)
         key_storage = SqlServerKeyStorage(conn_str)
         audit_storage = SqlServerAuditStorage(conn_str)
@@ -574,6 +579,44 @@ class IAMBackendServer:
                 "signature": req.get("signature"),
             })
             
+        # E2E - Chat Invite (Initiator → Responder, Sign-then-Encrypt)
+        elif relay_type == "chat_invite":
+            sender_cert = self.pki.lookup(user_id)
+            if sender_cert is None:
+                conn.send({"type": "error", "message": "Sender certificate not found"})
+                return
+            target_conn.send({
+                "type": "peer_chat_invite",
+                "sender_id": user_id,
+                "sender_cert_chain": self.pki.get_cert_chain_pems(sender_cert),
+                "crls": self.pki.get_all_crls_pem(),
+                "encrypted_ek": req.get("encrypted_ek"),
+                "nonce": req.get("nonce"),
+                "ciphertext": req.get("ciphertext"),
+                "tag": req.get("tag"),
+            })
+
+        # E2E - Chat Accept (Responder → Initiator)
+        elif relay_type == "chat_accept":
+            sender_cert = self.pki.lookup(user_id)
+            if sender_cert is None:
+                conn.send({"type": "error", "message": "Sender certificate not found"})
+                return
+            target_conn.send({
+                "type": "peer_chat_accept",
+                "sender_id": user_id,
+                "sender_cert_chain": self.pki.get_cert_chain_pems(sender_cert),
+                "crls": self.pki.get_all_crls_pem(),
+                "signature": req.get("signature"),
+            })
+
+        # E2E - Chat Decline (Responder → Initiator)
+        elif relay_type == "chat_decline":
+            target_conn.send({
+                "type": "peer_chat_decline",
+                "sender_id": user_id,
+            })
+
         # E2E - Chat Message
         elif relay_type == "chat_msg":
             self.audit_logger.log_event(AuditEventType.MESSAGE_RECEIVED, user_id, "backend", "relay", "success", details={"to": resolved_target_id})

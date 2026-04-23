@@ -162,7 +162,7 @@ class SecureTransmissionChannel:
         
         cipher = Cipher(
             algorithms.AES(key),
-            modes.GCM(nonce, tag),
+            modes.GCM(nonce, tag), # galois counter mode
             backend=default_backend()
         )
         decryptor = cipher.decryptor()

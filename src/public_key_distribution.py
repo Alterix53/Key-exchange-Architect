@@ -116,6 +116,13 @@ class RootCA:
 
     def __init__(self, data_dir: str = "pki_data", cn: str = "IAM Root CA",
                  org: str = "IAM Security System", validity_years: int = 10):
+        """ Khởi tạo Root CA. Nếu đã tồn tại thì tải lên, nếu không thì tạo mới.
+        Args:
+            data_dir: Thư mục lưu trữ dữ liệu PKI
+            cn: Common Name cho Root CA
+            org: Organization Name cho Root CA
+            validity_years: Số năm hiệu lực của Root CA
+        """
         self.data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
 
@@ -582,7 +589,7 @@ class PKISystem:
         print("  KHỞI TẠO HỆ THỐNG PKI (Public Key Infrastructure)")
         print("=" * 60)
 
-        # 1. Certificate Repository
+        # 1. Certificate Repository - thư mục CA
         self.repository = CertificateRepository(data_dir)
 
         # 2. Root CA

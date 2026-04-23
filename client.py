@@ -80,6 +80,11 @@ class IAMDemoClient:
         self.client_cert_chain: Optional[List[str]] = None
         self.current_crls: List[str] = []
 
+        # E2E Chat invite/accept handshake state
+        self.pending_chat_invite: Optional[Dict] = None
+        self._chat_ready_event = threading.Event()
+        self._chat_accepted = False
+
         self._receive_thread = None
         self._running = False
         
@@ -309,9 +314,32 @@ class IAMDemoClient:
                     if req_type == "relayed_chat_msg":
                         self._handle_chat_message(data)
                         continue
-                    elif req_type in {"peer_session_key", "relay_session_key"}:
-                        self._handle_peer_session_key(data)
+
+                # Chat invite/handshake handlers (work outside chat mode)
+                if req_type == "peer_chat_invite":
+                    if self.in_chat_mode:
+                        # Đang bận chat — tự động từ chối để Initiator không chờ vô ích
+                        self._send_req({
+                            "type": "relay",
+                            "relay_type": "chat_decline",
+                            "target_id": data.get("sender_id", ""),
+                        })
                         continue
+                    self.pending_chat_invite = data
+                    sender = data.get("sender_id", "?")
+                    print(f"\n{Colors.OKCYAN}[INVITE] {sender} mời bạn chat E2E. Chọn '5. Chế độ chat' ở menu để phản hồi.{Colors.ENDC}")
+                    continue
+
+                if req_type == "peer_chat_accept" and not self.in_chat_mode:
+                    self._handle_chat_accept(data)
+                    continue
+
+                if req_type == "peer_chat_decline" and not self.in_chat_mode:
+                    sender = data.get("sender_id", "?")
+                    print(f"\n{Colors.FAIL}[CHAT] {sender} đã từ chối lời mời chat.{Colors.ENDC}")
+                    self._chat_accepted = False
+                    self._chat_ready_event.set()
+                    continue
 
                 if req_type == "peer_joined":
                     joined = data.get("username") or data.get("user_id") or "unknown"
@@ -340,77 +368,67 @@ class IAMDemoClient:
             if not self.chat_session_key:
                 print(f"\n{Colors.WARNING}[CẢNH BÁO] Nhận được tin nhắn nhưng chưa có session key!{Colors.ENDC}")
                 return
-            
-            # không nhận trực tiếp tin nhắn, chỉ nhận các thành phần cần mã hóa
             sender = data.get("sender_id")
             nonce = data.get("nonce", "")
             ciphertext = data.get("ciphertext", "")
             tag = data.get("tag", "")
             assoc_data = data.get("associated_data", "")
-            
             plaintext = self.channel.decrypt_aes_256_gcm(nonce, ciphertext, tag, self.chat_session_key, assoc_data)
-            print(f"\n{Colors.OKBLUE}[DECRYPT] {sender}: {plaintext}{Colors.ENDC}")
+            print(f"\n{Colors.OKBLUE}[{sender}] {plaintext}{Colors.ENDC}")
         except Exception as e:
             print(f"\n{Colors.FAIL}[LỖI DECRYPT] {str(e)}{Colors.ENDC}")
 
-    def _handle_peer_session_key(self, data: Dict):
+    def _handle_chat_accept(self, data: Dict):
+        """Chạy từ receive thread: Initiator nhận chat_accept từ Responder."""
         try:
-            encrypted_key = data.get("encrypted_key", "")
-            signature = data.get("signature", "")
-            sender_cert_chain = data.get("sender_cert_chain")
             sender_id = data.get("sender_id", "")
+            sender_cert_chain = data.get("sender_cert_chain")
             crls = data.get("crls") or self.current_crls
+            signature = data.get("signature", "")
 
-            if not sender_cert_chain:
-                # Fallback cho payload legacy nếu có.
-                legacy_sender_cert = data.get("sender_cert") or {}
-                sender_cert_chain = legacy_sender_cert.get("chain_pems")
-                if not crls:
-                    crls = legacy_sender_cert.get("crls_pem") or []
-            
-            if not signature or not sender_cert_chain or not sender_id:
-                print(f"\n{Colors.FAIL}[LỖI MUTUAL AUTH] Gói tin Session Key thiếu Chữ ký hoặc Chứng chỉ từ {sender_id}. Bị từ chối!{Colors.ENDC}")
+            if not sender_cert_chain or not signature or not sender_id:
+                print(f"\n{Colors.FAIL}[CHAT ACCEPT] Thiếu cert hoặc chữ ký từ {sender_id}. Từ chối.{Colors.ENDC}")
+                self._chat_accepted = False
+                self._chat_ready_event.set()
                 return
 
             if not self.ca_public_key_pem:
-                print(f"\n{Colors.FAIL}[LỖI MUTUAL AUTH] Thiếu trusted CA key. Bị từ chối!{Colors.ENDC}")
-                return
-                
-            # --- MUTUAL AUTH: XÁC THỰC SENDER TRƯỚC KHI TIN TƯỞNG PUBLIC KEY ---
-            print(f"\n{Colors.OKCYAN}[MUTUAL AUTH] Đang xác minh chứng chỉ của {sender_id}...{Colors.ENDC}")
-            is_valid_chain, chain_msg = verify_certificate_chain(
-                sender_cert_chain,
-                self.ca_public_key_pem,
-                crl_pems=crls,
-            )
-            if not is_valid_chain:
-                print(f"{Colors.FAIL}[LỖI MUTUAL AUTH] Sender chain không hợp lệ: {chain_msg}{Colors.ENDC}")
+                print(f"\n{Colors.FAIL}[CHAT ACCEPT] Thiếu trusted CA key. Từ chối.{Colors.ENDC}")
+                self._chat_accepted = False
+                self._chat_ready_event.set()
                 return
 
-            sender_subject = self._extract_cn_from_cert_pem(sender_cert_chain[0])
-            if sender_subject != sender_id:
-                print(f"{Colors.FAIL}[LỖI MUTUAL AUTH] Subject mismatch: expected={sender_id}, got={sender_subject}{Colors.ENDC}")
-                print(f"{Colors.FAIL}[LỖI MUTUAL AUTH] Chứng chỉ của {sender_id} KHÔNG HỢP LỆ! Từ chối nhận session key.{Colors.ENDC}")
+            is_valid, chain_msg = verify_certificate_chain(sender_cert_chain, self.ca_public_key_pem, crl_pems=crls)
+            if not is_valid:
+                print(f"\n{Colors.FAIL}[CHAT ACCEPT] Cert của {sender_id} không hợp lệ: {chain_msg}{Colors.ENDC}")
+                self._chat_accepted = False
+                self._chat_ready_event.set()
                 return
-            print(f"{Colors.OKGREEN}✓ Chứng chỉ của {sender_id} hợp lệ.{Colors.ENDC}")
-            # --- END MUTUAL AUTH ---
-                
-            # Trích xuất Public Key của người gửi từ Chứng chỉ đính kèm
+
+            subject_cn = self._extract_cn_from_cert_pem(sender_cert_chain[0])
+            if subject_cn != sender_id:
+                print(f"\n{Colors.FAIL}[CHAT ACCEPT] Subject mismatch: expected={sender_id}, got={subject_cn}{Colors.ENDC}")
+                self._chat_accepted = False
+                self._chat_ready_event.set()
+                return
+
             peer_pub_key = self._extract_public_key_from_chain(sender_cert_chain)
-            
-            # Giải mã lấy Raw Session Key (vẫn dạng base64)
-            key_b64 = self.channel.decrypt_rsa_oaep(encrypted_key, self.private_key)
-            
-            # Verify chữ ký bằng đúng Raw Session Key b64
-            is_valid_sig = self.channel.verify_signature(key_b64, signature, peer_pub_key)
-            if not is_valid_sig:
-                print(f"\n{Colors.FAIL}[LỖI MUTUAL AUTH] Chữ ký số từ {sender_id} KHÔNG HỢP LỆ! Nghi ngờ giả mạo. Bị từ chối!{Colors.ENDC}")
+            my_id = self.user_info.get("user_id", "") if self.user_info else ""
+            # Responder đã ký: "accept|initiator_id|responder_id"
+            accept_msg = f"accept|{my_id}|{sender_id}"
+            if not self.channel.verify_signature(accept_msg, signature, peer_pub_key):
+                print(f"\n{Colors.FAIL}[CHAT ACCEPT] Chữ ký chấp nhận của {sender_id} KHÔNG HỢP LỆ!{Colors.ENDC}")
+                self._chat_accepted = False
+                self._chat_ready_event.set()
                 return
-                
-            self.chat_session_key = base64.b64decode(key_b64)
-            print(f"\n{Colors.OKGREEN}[STATUS] Mutual Auth thành công! Đã nhận session key từ {sender_id}. Sẵn sàng Chat!{Colors.ENDC}")
+
+            print(f"\n{Colors.OKGREEN}✓ {sender_id} đã chấp nhận lời mời chat và xác thực thành công!{Colors.ENDC}")
+            self._chat_accepted = True
+            self._chat_ready_event.set()
         except Exception as e:
-            print(f"\n{Colors.FAIL}[LỖI KEY XCHG] Không thể giải mã/xác nhận session key: {str(e)}{Colors.ENDC}")
+            print(f"\n{Colors.FAIL}[CHAT ACCEPT] Lỗi xử lý: {e}{Colors.ENDC}")
+            self._chat_accepted = False
+            self._chat_ready_event.set()
 
     # ------------------ MENUS & UI ------------------
 
@@ -698,89 +716,231 @@ class IAMDemoClient:
 
     def do_chat_e2e(self):
         print_header("Chế độ Chat Mã hóa E2E")
-        self.do_chat_directory() # Show danh bạ thu gọn
+        if self.pending_chat_invite:
+            self._do_chat_respond()
+        else:
+            self._do_chat_initiate()
 
-        target_uid = input("\nNhập Username (ưu tiên) hoặc User ID muốn chat: ").strip()
+    # ── Initiator flow ──────────────────────────────────────────────
+
+    def _do_chat_initiate(self):
+        self.do_chat_directory()
+        target_uid = input("\nNhập Username hoặc User ID muốn chat: ").strip()
         if not target_uid:
             return
-            
+
+        # 1. Lấy và xác minh cert của đối tác
         print("[1] Đang lấy Certificate của đối tác...")
         res = self._sync_request({
             "type": "relay",
             "relay_type": "cert_request",
-            "target_id": target_uid
+            "target_id": target_uid,
         }, "cert_response")
-        
         if not res:
             return
-            
-        resolved_target_id = res.get("target_id", target_uid)
-        cert_chain = res.get("cert_chain") or []
-        crls = res.get("crls") or []
+
+
+        resolved_target_id = res.get("target_id", target_uid) # lấy id của đối tác từ response để so khớp với CN trong cert, fallback về target_uid nếu server không trả
+        cert_chain = res.get("cert_chain") or [] # lấy certificate chain của đối tác, nếu server không trả về thì mặc định là empty list để verify_certificate_chain xử lý và báo
+        crls = res.get("crls") or [] # lấy CRL list từ response, nếu server không trả về thì fallback về current_crls của client
+
         if not self.ca_public_key_pem:
-            print_error("Thiếu public key của CA để xác minh!")
+            print_error("Thiếu trusted CA key.")
             return
 
-        is_valid, verify_msg = verify_certificate_chain(
-            cert_chain,
-            self.ca_public_key_pem,
-            crl_pems=crls,
-        )
+        is_valid, verify_msg = verify_certificate_chain(cert_chain, self.ca_public_key_pem, crl_pems=crls)
         if not is_valid:
             print_error(f"Certificate chain KHÔNG HỢP LỆ: {verify_msg}")
-            print_error("Dừng kết nối.")
             return
 
         subject_cn = self._extract_cn_from_cert_pem(cert_chain[0])
         if subject_cn != resolved_target_id:
             print_error(f"Subject cert mismatch: expected={resolved_target_id}, got={subject_cn}")
-            print_error("Certificate KHÔNG HỢP LỆ! Dừng kết nối.")
             return
-            
-        print_success("Certificate hợp lệ.")
+
+        print_success(f"Certificate của {resolved_target_id} hợp lệ.")
         self.current_crls = crls
+
+        # lấy public key của người cần chat
+        # mục đích: 1. verify chữ ký của Bob trong bước accept
+        #        2. mã hóa session key khi gửi invite (Sign-then-Encrypt)
         self.chat_peer_public_key = self._extract_public_key_from_chain(cert_chain)
-        
-        print("[2] Khởi tạo Key Exchange (RSA) và Ký hiệu (Digital Signature)...")
-        self.chat_session_key = os.urandom(32)
-        session_key_b64 = base64.b64encode(self.chat_session_key).decode("utf-8")
-        
-        # Mã hóa bằng Public Key của đối tác
-        encrypted_key = self.channel.encrypt_rsa_oaep(
-            session_key_b64, 
-            self.chat_peer_public_key
+        self.chat_peer_id = resolved_target_id
+
+        # 2. Tạo session key, Sign-then-Encrypt (hybrid)
+        print("[2] Tạo Session Key và ký (Sign-then-Encrypt)...")
+        self.chat_session_key = os.urandom(32) # tạo sessino key 32 byte 
+        session_key_b64 = base64.b64encode(self.chat_session_key).decode()
+        my_id = self.user_info.get("user_id", "") if self.user_info else ""
+
+        # Sign: ràng buộc session key với danh tính cả 2 bên
+        sign_msg = f"{session_key_b64}|{my_id}|{resolved_target_id}"
+        signature = self.channel.sign_message(sign_msg, self.private_key)
+
+        # Hybrid encrypt: AES-GCM mã hóa bundle, RSA-OAEP mã hóa AES key
+        ek = os.urandom(32)
+        bundle = json.dumps({
+            "session_key": session_key_b64,
+            "signature": signature,
+            "sender_id": my_id,
+            "target_id": resolved_target_id,
+        })
+        nonce_b, ct_b, tag_b = self.channel.encrypt_aes_256_gcm(bundle, ek)
+        encrypted_ek = self.channel.encrypt_rsa_oaep(
+            base64.b64encode(ek).decode(), self.chat_peer_public_key
         )
-        
-        # Ký điện tử Payload (giữ tính nguyên vẹn và xác thực bằng Private Key của mình)
-        signature = self.channel.sign_message(session_key_b64, self.private_key)
-        
+
+        # 3. Gửi chat_invite
         self._send_req({
             "type": "relay",
-            "relay_type": "relay_session_key",
+            "relay_type": "chat_invite",
             "target_id": resolved_target_id,
-            "encrypted_key": encrypted_key,
-            "signature": signature
+            "encrypted_ek": encrypted_ek,
+            "nonce": nonce_b,
+            "ciphertext": ct_b,
+            "tag": tag_b,
         })
-        print_success("Đã gửi Session Key. Sẵn sàng chat!")
-        
+        print_success(f"Đã gửi lời mời chat tới {resolved_target_id}. Đang chờ phản hồi (tối đa 60s)...")
+
+        # 4. Chờ Bob accept / decline
+        self._chat_ready_event.clear()
+        self._chat_accepted = False
+        responded = self._chat_ready_event.wait(timeout=60)
+
+        if not responded:
+            print_error("Hết thời gian chờ. Lời mời không được phản hồi.")
+            self._reset_chat_state()
+            return
+
+        if not self._chat_accepted:
+            print_error(f"{resolved_target_id} đã từ chối hoặc xác thực thất bại.")
+            self._reset_chat_state()
+            return
+
+        # 5. Vào chat mode
         self.in_chat_mode = True
-        self.chat_peer_id = resolved_target_id
-        
-        print(f"\n{Colors.WARNING}--- Bắt đầu Chat (gõ 'back' để thoát) ---{Colors.ENDC}")
+        print(f"\n{Colors.WARNING}--- Chat với {resolved_target_id} (gõ 'back' để thoát) ---{Colors.ENDC}")
+        self._run_chat_loop()
+
+    # ── Responder flow ──────────────────────────────────────────────
+
+    def _do_chat_respond(self):
+        invite = self.pending_chat_invite
+        self.pending_chat_invite = None
+        if invite is None:
+            return
+        sender_id = invite.get("sender_id", "?")
+
+        answer = input(f"\n{Colors.OKCYAN}{sender_id} mời bạn chat E2E. Chấp nhận? (y/n): {Colors.ENDC}").strip().lower()
+        if answer != "y":
+            self._send_req({
+                "type": "relay",
+                "relay_type": "chat_decline",
+                "target_id": sender_id,
+            })
+            print("Đã từ chối lời mời.")
+            return
+
+        # Narrow Optional types thành str/List[str] rõ ràng để type-checker hài lòng
+        sender_cert_chain: List[str] = invite.get("sender_cert_chain") or []
+        crls: List[str] = invite.get("crls") or self.current_crls
+        encrypted_ek: str = invite.get("encrypted_ek") or ""
+        nonce_b: str = invite.get("nonce") or ""
+        ct_b: str = invite.get("ciphertext") or ""
+        tag_b: str = invite.get("tag") or ""
+
+        if not all([sender_cert_chain, encrypted_ek, nonce_b, ct_b, tag_b]):
+            print_error("Lời mời thiếu dữ liệu cần thiết. Hủy.")
+            return
+
+        if not self.ca_public_key_pem:
+            print_error("Thiếu trusted CA key. Hủy.")
+            return
+
+        # 1. Xác minh cert Alice
+        print(f"{Colors.OKCYAN}[MUTUAL AUTH] Đang xác minh chứng chỉ của {sender_id}...{Colors.ENDC}")
+        is_valid, chain_msg = verify_certificate_chain(sender_cert_chain, self.ca_public_key_pem, crl_pems=crls)
+        if not is_valid:
+            print_error(f"Cert chain của {sender_id} không hợp lệ: {chain_msg}")
+            return
+
+        subject_cn = self._extract_cn_from_cert_pem(sender_cert_chain[0])
+        if subject_cn != sender_id:
+            print_error(f"Subject mismatch: expected={sender_id}, got={subject_cn}")
+            return
+
+        print_success(f"Chứng chỉ của {sender_id} hợp lệ.")
+        peer_pub_key = self._extract_public_key_from_chain(sender_cert_chain)
+        self.current_crls = crls
+
+        # 2. Decrypt-then-Verify (hybrid)
+        try:
+            ek_b64 = self.channel.decrypt_rsa_oaep(encrypted_ek, self.private_key)
+            ek = base64.b64decode(ek_b64)
+            bundle_json = self.channel.decrypt_aes_256_gcm(nonce_b, ct_b, tag_b, ek)
+            bundle = json.loads(bundle_json)
+        except Exception as e:
+            print_error(f"Giải mã thất bại: {e}")
+            return
+
+        session_key_b64 = bundle.get("session_key", "")
+        signature = bundle.get("signature", "")
+        bundle_sender = bundle.get("sender_id", "")
+        bundle_target = bundle.get("target_id", "")
+        my_id = self.user_info.get("user_id", "") if self.user_info else ""
+
+        # Kiểm tra identity binding trong bundle
+        if bundle_sender != sender_id or bundle_target != my_id:
+            print_error(f"Bundle identity mismatch: sender={bundle_sender}, target={bundle_target}")
+            return
+
+        # Verify chữ ký của Alice (Sign-then-Encrypt: verify sau decrypt)
+        sign_msg = f"{session_key_b64}|{bundle_sender}|{bundle_target}"
+        if not self.channel.verify_signature(sign_msg, signature, peer_pub_key):
+            print_error(f"Chữ ký số của {sender_id} KHÔNG HỢP LỆ! Từ chối.")
+            return
+
+        print_success(f"Xác minh danh tính {sender_id} thành công. Đã nhận session key.")
+        self.chat_session_key = base64.b64decode(session_key_b64)
+        self.chat_peer_id = sender_id
+        self.chat_peer_public_key = peer_pub_key
+
+        # 3. Gửi chat_accept kèm chữ ký xác nhận
+        accept_msg = f"accept|{sender_id}|{my_id}"
+        accept_sig = self.channel.sign_message(accept_msg, self.private_key)
+        self._send_req({
+            "type": "relay",
+            "relay_type": "chat_accept",
+            "target_id": sender_id,
+            "signature": accept_sig,
+        })
+
+        # 4. Vào chat mode
+        self.in_chat_mode = True
+        print(f"\n{Colors.WARNING}--- Chat với {sender_id} (gõ 'back' để thoát) ---{Colors.ENDC}")
+        self._run_chat_loop()
+
+    # ── Shared chat UI ──────────────────────────────────────────────
+
+    def _run_chat_loop(self):
+        my_id = self.user_info.get("user_id", "") if self.user_info else ""
+        session_key = self.chat_session_key
+        if session_key is None:
+            return
         try:
             while True:
                 msg = input("")
-                if msg.strip() == "back":
+                if msg.strip().lower() == "back":
                     break
                 if not msg.strip():
                     continue
-                    
-                assoc_data = f"{self.user_info.get('user_id')}:relay"
-                nonce, ciphertext, tag = self.channel.encrypt_aes_256_gcm(msg, self.chat_session_key, assoc_data)
-                
-                # In ra log ENCRYPT
-                print(f"{Colors.WARNING}[ENCRYPT] {json.dumps({'nonce': nonce[:10]+'...', 'ciphertext': ciphertext[:20]+'...'}, ensure_ascii=False)}{Colors.ENDC}")
-                
+
+                # associated_data ràng buộc cả sender lẫn receiver
+                assoc_data = f"{my_id}:{self.chat_peer_id}"
+                nonce, ciphertext, tag = self.channel.encrypt_aes_256_gcm(
+                    msg, session_key, assoc_data
+                )
+                print(f"{Colors.WARNING}[ENCRYPT] nonce={nonce[:10]}... ct={ciphertext[:20]}...{Colors.ENDC}")
                 self._send_req({
                     "type": "relay",
                     "relay_type": "chat_msg",
@@ -789,14 +949,18 @@ class IAMDemoClient:
                     "nonce": nonce,
                     "ciphertext": ciphertext,
                     "tag": tag,
-                    "associated_data": assoc_data
+                    "associated_data": assoc_data,
                 })
         except Exception as e:
             print_error(f"Chat error: {e}")
         finally:
-            self.in_chat_mode = False
-            self.chat_peer_id = None
-            self.chat_session_key = None
+            self._reset_chat_state()
+
+    def _reset_chat_state(self):
+        self.in_chat_mode = False
+        self.chat_peer_id = None
+        self.chat_session_key = None
+        self.chat_peer_public_key = None
 
     def request_session_key_via_kdc(self, peer_id: str, ttl: int = 300) -> bool:
         """Request a session key for peer_id from KDC via server."""
