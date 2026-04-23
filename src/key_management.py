@@ -298,6 +298,18 @@ class KeyStore:
                 data['key_size'], data['purpose'],
                 private_key_password_protected=data.get('private_key_password_protected', False)
             )
+            # Khôi phục đầy đủ metadata từ storage để tránh sai lệch vòng đời khóa
+            created_at_raw = data.get('created_at') or data.get('creation_date')
+            expires_at_raw = data.get('expires_at')
+            last_rotated_raw = data.get('last_rotated')
+
+            if created_at_raw:
+                metadata.created_at = datetime.fromisoformat(created_at_raw)
+            if expires_at_raw:
+                metadata.expires_at = datetime.fromisoformat(expires_at_raw)
+            if last_rotated_raw:
+                metadata.last_rotated = datetime.fromisoformat(last_rotated_raw)
+
             metadata.is_active = data['is_active']
             metadata.version = data['version']
             self.keys_metadata[key_id] = metadata
@@ -313,8 +325,17 @@ class KeyStore:
             if metadata is None:
                 continue
 
+            # Tự động đồng bộ trạng thái key hết hạn thành inactive.
+            if metadata.is_expired() and metadata.is_active:
+                metadata.is_active = False
+                self.storage.save_metadata(key_id, metadata.to_dict())
+
             if owner is None or metadata.owner == owner:
-                keys.append(metadata.to_dict())
+                item = metadata.to_dict()
+                item['is_expired'] = metadata.is_expired()
+                if item['is_expired']:
+                    item['is_active'] = False
+                keys.append(item)
         
         return keys
     

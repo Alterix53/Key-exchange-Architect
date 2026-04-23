@@ -67,7 +67,7 @@ class CertificateRepository:
             "serial": serial_hex,
             "file": filepath,
             "issuer": _get_cn(cert.issuer),
-            "not_after": cert.not_valid_after.isoformat(),
+            "not_after": cert.not_valid_after_utc.isoformat(),
             "label": label,
         }
         self._save_index()
@@ -119,9 +119,14 @@ class RootCA:
         self.data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
 
-        self.ca_key_path = os.path.join(data_dir, "root_ca_private.pem")
-        self.ca_cert_path = os.path.join(data_dir, "root_ca_cert.pem")
-        self.crl_path = os.path.join(data_dir, "root_ca.crl")
+        self.private_dir = os.path.join(data_dir, "root", "private")
+        self.certs_dir = os.path.join(data_dir, "root", "certs")
+        os.makedirs(self.private_dir, exist_ok=True)
+        os.makedirs(self.certs_dir, exist_ok=True)
+
+        self.ca_key_path = os.path.join(self.private_dir, "root.key")
+        self.ca_cert_path = os.path.join(self.certs_dir, "root.crt")
+        self.crl_path = os.path.join(self.certs_dir, "root.crl")
 
         self._revoked_serials: List[Tuple[int, datetime]] = []
 
@@ -307,9 +312,15 @@ class IntermediateCA:
                  cn: str = "IAM Intermediate CA", org: str = "IAM Security System",
                  validity_years: int = 5):
         self.data_dir = data_dir
-        self.ca_key_path = os.path.join(data_dir, "intermediate_ca_private.pem")
-        self.ca_cert_path = os.path.join(data_dir, "intermediate_ca_cert.pem")
-        self.crl_path = os.path.join(data_dir, "intermediate_ca.crl")
+
+        self.private_dir = os.path.join(data_dir, "intermediate", "private")
+        self.certs_dir = os.path.join(data_dir, "intermediate", "certs")
+        os.makedirs(self.private_dir, exist_ok=True)
+        os.makedirs(self.certs_dir, exist_ok=True)
+
+        self.ca_key_path = os.path.join(self.private_dir, "intermediate.key")
+        self.ca_cert_path = os.path.join(self.certs_dir, "intermediate.crt")
+        self.crl_path = os.path.join(self.certs_dir, "intermediate.crl")
 
         self._revoked_serials: List[Tuple[int, datetime]] = []
 
@@ -563,7 +574,7 @@ class PKISystem:
     Tạo 1 instance duy nhất trên server để quản lý toàn bộ PKI.
     """
 
-    def __init__(self, data_dir: str = "pki_data"):
+    def __init__(self, data_dir: str = "pki"):
         self.data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
 
@@ -886,7 +897,7 @@ class CertificateAuthority:
     Delegate sang PKISystem.
     """
 
-    def __init__(self, data_dir: str = "data"):
+    def __init__(self, data_dir: str = "pki"):
         self.pki = PKISystem(data_dir)
         self.cert_repository: Dict[str, Dict] = {}
         self.crl: set = set()
@@ -940,7 +951,7 @@ class CertificateAuthority:
             "subject": subject,
             "public_key": public_key_pem,
             "valid_from": cert.not_valid_before.isoformat(),
-            "valid_to": cert.not_valid_after.isoformat(),
+            "valid_to": cert.not_valid_after_utc.isoformat(),
             "cert_pem": serialize_cert_to_pem(cert),
             "chain_pems": self.pki.get_cert_chain_pems(cert),
             "crls_pem": self.pki.get_all_crls_pem(),

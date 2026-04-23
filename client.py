@@ -20,6 +20,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
 from src.public_key_distribution import verify_certificate, extract_public_key
 
+CA_PULLIC_KEY_SRC = "pki/root/certs/root.crt"
+
 # ANSI Colors
 class Colors:
     HEADER = '\033[95m'
@@ -89,7 +91,7 @@ class IAMDemoClient:
             self._receive_thread.start()
             
             # Load CA PublicKey (PINNED TRUSTED ROOT)
-            ca_path = "data/ca_public.pem"
+            ca_path = CA_PULLIC_KEY_SRC
             if os.path.exists(ca_path):
                 with open(ca_path, "r") as f:
                     self.ca_public_key_pem = f.read()
@@ -191,7 +193,8 @@ class IAMDemoClient:
             if not self.chat_session_key:
                 print(f"\n{Colors.WARNING}[CẢNH BÁO] Nhận được tin nhắn nhưng chưa có session key!{Colors.ENDC}")
                 return
-                
+            
+            # không nhận trực tiếp tin nhắn, chỉ nhận các thành phần cần mã hóa
             sender = data.get("sender_id")
             nonce = data.get("nonce", "")
             ciphertext = data.get("ciphertext", "")
@@ -423,7 +426,10 @@ class IAMDemoClient:
             if not keys:
                 print("Chưa có khóa nào.")
             for k in keys:
-                active = "Hoạt động" if k['is_active'] else "Đã vô hiệu"
+                if k.get('is_expired'):
+                    active = "Hết hạn"
+                else:
+                    active = "Hoạt động" if k['is_active'] else "Đã vô hiệu"
                 print(f" • {k['key_id']} | {k['algorithm']} | {k['purpose']} | {active}")
 
     def do_cert_info(self):

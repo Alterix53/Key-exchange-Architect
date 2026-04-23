@@ -68,7 +68,7 @@ class IAMBackendServer:
         self.key_store = KeyStore("demo_keys", storage=key_storage)
         self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
             
-        self.ca = CertificateAuthority(data_dir="data")
+        self.ca = CertificateAuthority(data_dir="pki")
         self.channel = SecureTransmissionChannel()
         self.replay_protector = ReplayProtector(time_window_seconds=30)
         
