@@ -23,7 +23,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.identity_management import IdentityManagementSystem, Role, Permission
 from src.key_management import KeyStore
 from src.audit_logging import AuditLogger, AuditEventType
-from src.public_key_distribution import CertificateAuthority
+from src.public_key_distribution import (
+    PKISystem,
+    create_csr,
+    load_csr_from_pem,
+    serialize_cert_to_pem,
+)
 from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
 from src.kdc import KDC
 
@@ -70,21 +75,21 @@ class IAMBackendServer:
         self.iam = IdentityManagementSystem("demo_identity", storage=user_storage)
         self.key_store = KeyStore("demo_keys", storage=key_storage)
         self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
-            
-        self.ca = CertificateAuthority(data_dir="data")
+
+        self.pki = PKISystem(data_dir="pki")
         
         # --- MUTUAL AUTH: Khởi tạo Server Identity ---
-        server_priv_path = "data/server_private.pem"
-        server_cert_path = "data/server_cert.pem"
-        
-        if os.path.exists(server_priv_path) and os.path.exists(server_cert_path):
+        server_dir = os.path.join("pki", "server")
+        os.makedirs(server_dir, exist_ok=True)
+        server_priv_path = os.path.join(server_dir, "server_private.pem")
+        server_cert_path = os.path.join(server_dir, "server_cert.pem")
+
+        if os.path.exists(server_priv_path):
             with open(server_priv_path, "rb") as f:
                 self.server_private_key = serialization.load_pem_private_key(f.read(), password=None)
-            with open(server_cert_path, "r", encoding="utf-8") as f:
-                self.server_cert_pem = f.read()
-            print("[SERVER] Đã tải Server Certificate từ file.")
+            print("[SERVER] Đã tải Server Private Key từ file.")
         else:
-            print("[SERVER] Khởi tạo Server Identity mới...")
+            print("[SERVER] Khởi tạo Server Private Key mới...")
             self.server_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
             with open(server_priv_path, "wb") as f:
                 f.write(self.server_private_key.private_bytes(
@@ -92,16 +97,19 @@ class IAMBackendServer:
                     format=serialization.PrivateFormat.TraditionalOpenSSL,
                     encryption_algorithm=serialization.NoEncryption()
                 ))
-            server_pub_pem = self.server_private_key.public_key().public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo,
-            ).decode("utf-8")
-            
-            # Yêu cầu CA cấp chứng chỉ với Subject là IAM-Server
-            self.server_cert_pem = self.ca.issue_certificate("IAM-Server", server_pub_pem)
-            with open(server_cert_path, "w", encoding="utf-8") as f:
-                f.write(self.server_cert_pem)
-            print("[SERVER] Đã tạo và cấp Server Certificate mới (IAM-Server).")
+
+        # Luôn cấp/re-cấp server cert qua CSR để đi đúng flow RA -> Intermediate CA.
+        server_csr = create_csr("IAM-Server", "IAM Security System", self.server_private_key)
+        server_cert = self.pki.issue_cert_from_csr(server_csr, is_server=True)
+        if server_cert is None:
+            raise RuntimeError("Không thể cấp Server Certificate từ PKI")
+
+        self.server_cert_pem = serialize_cert_to_pem(server_cert)
+        self.server_cert_chain_pems = self.pki.get_cert_chain_pems(server_cert)
+
+        with open(server_cert_path, "w", encoding="utf-8") as f:
+            f.write(self.server_cert_pem)
+        print("[SERVER] Đã cấp Server Certificate mới qua CSR (IAM-Server).")
         # --- END MUTUAL AUTH ---
         
         self.channel = SecureTransmissionChannel()
@@ -160,6 +168,31 @@ class IAMBackendServer:
             self.audit_logger.log_event(AuditEventType.PERMISSION_GRANTED, user_id, resource, action, "success")
         return has_perm
 
+    def _notify_peer_joined(self, joined_user_id: str) -> None:
+        """Thông báo người dùng mới online để bám flow peer_joined."""
+        joined_username = joined_user_id
+        user_obj = self.iam.users.get(joined_user_id)
+        if user_obj is not None:
+            joined_username = user_obj.username
+
+        payload = {
+            "type": "peer_joined",
+            "user_id": joined_user_id,
+            "username": joined_username,
+        }
+
+        with self.clients_lock:
+            recipients = [
+                c for uid, c in self.active_users.items()
+                if uid != joined_user_id
+            ]
+
+        for recipient in recipients:
+            try:
+                recipient.send(payload)
+            except Exception:
+                pass
+
     # ------------- [HANDLERS: API ROUTES] -------------
 
     def handle_login(self, req: Dict, conn: ClientConnection, ip: str) -> None:
@@ -194,6 +227,8 @@ class IAMBackendServer:
                 conn.user_id = session.user_id
                 self.active_users[session.user_id] = conn
 
+            self._notify_peer_joined(session.user_id)
+
             server_auth_proof = self.channel.sign_message(
                 f"{session.session_id}|{client_nonce}|login_ok",
                 self.server_private_key
@@ -204,7 +239,8 @@ class IAMBackendServer:
                 "session_id": session.session_id,
                 "user": user_info,
                 "server_auth_proof": server_auth_proof,
-                "server_cert": self.server_cert_pem
+                "server_cert_chain": self.server_cert_chain_pems,
+                "crls": self.pki.get_all_crls_pem(),
             })
         else:
             self.audit_logger.log_event(AuditEventType.USER_FAILED_LOGIN, username, "backend", "login", "failed", ip_address=ip)
@@ -233,16 +269,93 @@ class IAMBackendServer:
         except Exception as e:
             conn.send({"type": "error", "message": f"Lỗi đăng ký: {str(e)}"})
 
+    def handle_hello(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
+        """Flow CSR: hello {csr} -> welcome {client_cert_chain, server_cert_chain}."""
+        csr_pem = req.get("csr_pem")
+        if not csr_pem:
+            conn.send({"type": "error", "message": "Thiếu csr_pem trong hello request"})
+            return
+
+        try:
+            csr = load_csr_from_pem(csr_pem)
+        except Exception as e:
+            conn.send({"type": "error", "message": f"CSR không hợp lệ: {e}"})
+            return
+
+        subject_cn = None
+        for attr in csr.subject:
+            if getattr(attr.oid, "_name", "") == "commonName":
+                subject_cn = attr.value
+                break
+
+        if subject_cn != user_id:
+            conn.send({
+                "type": "error",
+                "message": f"CSR subject '{subject_cn}' không khớp với user_id '{user_id}'",
+            })
+            return
+
+        self.audit_logger.log_event(
+            AuditEventType.CERT_CSR_RECEIVED,
+            user_id,
+            "pki",
+            "hello_csr",
+            "success",
+        )
+
+        cert = self.pki.issue_cert_from_csr(csr, is_server=False)
+        if cert is None:
+            self.audit_logger.log_event(
+                AuditEventType.CERT_ISSUED,
+                user_id,
+                "pki",
+                "issue_from_csr",
+                "failed",
+            )
+            conn.send({"type": "error", "message": "PKI từ chối cấp chứng chỉ từ CSR"})
+            return
+
+        client_cert_chain = self.pki.get_cert_chain_pems(cert)
+        crls = self.pki.get_all_crls_pem()
+
+        self.audit_logger.log_event(
+            AuditEventType.CERT_ISSUED,
+            user_id,
+            "pki",
+            "issue_from_csr",
+            "success",
+            details={"serial": format(cert.serial_number, "x")},
+        )
+
+        conn.send({
+            "type": "welcome",
+            "client_cert_chain": client_cert_chain,
+            "server_cert_chain": self.server_cert_chain_pems,
+            "crls": crls,
+        })
+
     def handle_cert_request(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
-        """Khi client muốn lấy certificate (kèm public key của CA)"""
-        public_key_pem = req.get("public_key")
-        if public_key_pem:
-            # Client gui public key len de cap chung chi
-            cert = self.ca.issue_certificate(user_id, public_key_pem)
-            conn.send({"type": "cert_info", "certificate": cert, "ca_public_key": self.ca.get_public_key_pem()})
-        else:
-            # Client chi hoi current cert, not implementing right now
-            conn.send({"type": "error", "message": "Please provide public_key to issue cert"})
+        """Lấy thông tin cert hiện tại của chính user."""
+        cert = self.pki.lookup(user_id)
+        if cert is None:
+            conn.send({"type": "error", "message": f"Không tìm thấy certificate cho {user_id}"})
+            return
+
+        cert_chain = self.pki.get_cert_chain_pems(cert)
+        crls = self.pki.get_all_crls_pem()
+        conn.send({
+            "type": "cert_info",
+            "subject": user_id,
+            "serial_number": format(cert.serial_number, "x"),
+            "cert_chain": cert_chain,
+            "crls": crls,
+            # Giữ thêm field cũ để tránh phá client legacy.
+            "certificate": {
+                "subject": user_id,
+                "chain_pems": cert_chain,
+                "crls_pem": crls,
+            },
+        })
 
     def handle_directory(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
         """Lấy danh sách Users & active status"""
@@ -275,7 +388,7 @@ class IAMBackendServer:
                 "user_id": uid,
                 "username": user.username,
                 "online": uid in self.active_users,
-                "has_cert": self.ca.get_certificate(uid) is not None
+                "has_cert": self.pki.lookup(uid) is not None
             })
         conn.send({"type": "chat_directory_response", "users": chat_users})
 
@@ -410,7 +523,7 @@ class IAMBackendServer:
         return None
 
     def handle_relay(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
-        """Trung chuyển gói tin E2E: chat, cert_request (để chat), session_key"""
+        """Trung chuyển gói tin E2E: cert_request, relay_session_key, chat_msg."""
         target_id = req.get("target_id")
         relay_type = req.get("relay_type")
         
@@ -430,21 +543,36 @@ class IAMBackendServer:
             return
         
         # E2E - Client muốn lấy cert của ng khác để chat
-        if relay_type == "get_cert":
-            target_cert = self.ca.get_certificate(resolved_target_id)
+        if relay_type in {"get_cert", "cert_request"}:
+            target_cert = self.pki.lookup(resolved_target_id)
             if target_cert:
-                conn.send({"type": "peer_cert_response", "target_id": resolved_target_id, "certificate": target_cert})
+                target_chain = self.pki.get_cert_chain_pems(target_cert)
+                crls = self.pki.get_all_crls_pem()
+                conn.send({
+                    "type": "cert_response",
+                    "target_id": resolved_target_id,
+                    "cert_chain": target_chain,
+                    "crls": crls,
+                })
             else:
                 conn.send({"type": "error", "message": f"Certificate for {resolved_target_id} not found"})
         
         # E2E - Gửi Session Key
-        elif relay_type == "session_key":
-            req["type"] = "peer_session_key"
-            req["sender_id"] = user_id
-            req["sender_cert"] = self.ca.get_certificate(user_id)
-            req["target_id"] = resolved_target_id
-            del req["relay_type"]
-            target_conn.send(req)
+        elif relay_type in {"session_key", "relay_session_key"}:
+            sender_cert = self.pki.lookup(user_id)
+            if sender_cert is None:
+                conn.send({"type": "error", "message": "Sender certificate not found"})
+                return
+
+            target_conn.send({
+                "type": "relay_session_key",
+                "sender_id": user_id,
+                "target_id": resolved_target_id,
+                "sender_cert_chain": self.pki.get_cert_chain_pems(sender_cert),
+                "crls": self.pki.get_all_crls_pem(),
+                "encrypted_key": req.get("encrypted_key"),
+                "signature": req.get("signature"),
+            })
             
         # E2E - Chat Message
         elif relay_type == "chat_msg":
@@ -478,7 +606,8 @@ class IAMBackendServer:
         )
         conn.send({
             "type": "server_hello", 
-            "certificate": self.server_cert_pem,
+            "server_cert_chain": self.server_cert_chain_pems,
+            "crls": self.pki.get_all_crls_pem(),
             "server_nonce": conn.server_nonce,
             "server_signature": server_hello_signature,
             "message": "Connected to IAM Backend Server. Please login or register."
@@ -517,6 +646,8 @@ class IAMBackendServer:
                     
                 if req_type == "cert_req":
                     self.handle_cert_request(req, conn, user_id)
+                elif req_type == "hello":
+                    self.handle_hello(req, conn, user_id)
                 elif req_type == "directory":
                     self.handle_directory(req, conn, user_id)
                 elif req_type == "chat_directory":

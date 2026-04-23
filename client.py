@@ -19,10 +19,17 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
-from src.public_key_distribution import verify_certificate, extract_public_key
+from src.public_key_distribution import (
+    verify_certificate_chain,
+    create_csr,
+    serialize_csr_to_pem,
+    load_cert_from_pem,
+)
 from src.kdc import KDC
 from src.secure_transmission import encrypt_json_with_key, decrypt_json_with_key
 
+
+CA_PULLIC_KEY_SRC = "pki/root/certs/root.crt"
 
 # ANSI Colors
 class Colors:
@@ -70,6 +77,8 @@ class IAMDemoClient:
         self.server_public_key: Any = None
         self.server_nonce: Optional[str] = None
         self.pending_login_nonce: Optional[str] = None
+        self.client_cert_chain: Optional[List[str]] = None
+        self.current_crls: List[str] = []
 
         self._receive_thread = None
         self._running = False
@@ -84,10 +93,88 @@ class IAMDemoClient:
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         ).decode("utf-8")
 
+    def _extract_cn_from_cert_pem(self, cert_pem: str) -> str:
+        cert = load_cert_from_pem(cert_pem)
+        for attr in cert.subject:
+            if getattr(attr.oid, "_name", "") == "commonName":
+                return attr.value
+        return "Unknown"
+
+    def _extract_public_key_from_chain(self, cert_chain: List[str]) -> Any:
+        if not cert_chain:
+            raise ValueError("Certificate chain is empty")
+        leaf_cert = load_cert_from_pem(cert_chain[0])
+        return leaf_cert.public_key()
+
+    def _perform_hello_csr(self) -> bool:
+        """hello {CSR} -> welcome {client_cert_chain, server_cert_chain}."""
+        if not self.user_info:
+            print_error("Thiếu thông tin user để tạo CSR.")
+            return False
+        if not self.ca_public_key_pem:
+            print_error("Thiếu trusted root certificate để verify chain.")
+            return False
+
+        user_id = self.user_info.get("user_id")
+        if not user_id:
+            print_error("Thiếu user_id để ràng buộc subject của CSR.")
+            return False
+
+        csr = create_csr(user_id, "IAM Security System", self.private_key)
+        res = self._sync_request(
+            {
+                "type": "hello",
+                "csr_pem": serialize_csr_to_pem(csr),
+            },
+            "welcome"
+        )
+        if not res:
+            return False
+
+        client_cert_chain = res.get("client_cert_chain") or []
+        server_cert_chain = res.get("server_cert_chain") or []
+        crls = res.get("crls") or []
+
+        if not client_cert_chain or not server_cert_chain:
+            print_error("welcome payload thiếu certificate chain.")
+            return False
+
+        server_valid, server_msg = verify_certificate_chain(
+            server_cert_chain,
+            self.ca_public_key_pem,
+            crl_pems=crls,
+        )
+        if not server_valid:
+            print_error(f"Server chain không hợp lệ: {server_msg}")
+            return False
+
+        if self._extract_cn_from_cert_pem(server_cert_chain[0]) != "IAM-Server":
+            print_error("Server leaf certificate subject không phải IAM-Server.")
+            return False
+
+        client_valid, client_msg = verify_certificate_chain(
+            client_cert_chain,
+            self.ca_public_key_pem,
+            crl_pems=crls,
+        )
+        if not client_valid:
+            print_error(f"Client chain không hợp lệ: {client_msg}")
+            return False
+
+        if self._extract_cn_from_cert_pem(client_cert_chain[0]) != user_id:
+            print_error("Client certificate subject không khớp user_id hiện tại.")
+            return False
+
+        self.client_cert_chain = client_cert_chain
+        self.current_crls = crls
+        self.server_public_key = self._extract_public_key_from_chain(server_cert_chain)
+        print_success("Hoàn tất hello/welcome với CSR và verify chain thành công.")
+        return True
+
     def connect(self):
         try:
             # Load CA PublicKey (PINNED TRUSTED ROOT)
-            ca_path = "data/ca_public.pem"
+            ca_path = CA_PULLIC_KEY_SRC
             if os.path.exists(ca_path):
                 with open(ca_path, "r", encoding="utf-8") as f:
                     self.ca_public_key_pem = f.read()
@@ -115,13 +202,23 @@ class IAMDemoClient:
                 
             try:
                 server_hello = json.loads(hello_line)
-                if server_hello.get("type") != "server_hello" or "certificate" not in server_hello:
-                    print_error("LỖI: Server protocol mismatch hoặc thiếu certificate.")
+                if server_hello.get("type") != "server_hello" or "server_cert_chain" not in server_hello:
+                    print_error("LỖI: Server protocol mismatch hoặc thiếu server_cert_chain.")
                     sys.exit(1)
-                    
-                server_cert = server_hello.get("certificate")
-                if not verify_certificate(server_cert, self.ca_public_key_pem, expected_subject="IAM-Server"):
-                    print_error("[CRITICAL] Không thể xác minh chứng chỉ của Server! Kết nối bị từ chối.")
+
+                server_cert_chain = server_hello.get("server_cert_chain") or []
+                server_crls = server_hello.get("crls") or []
+                is_valid, verify_msg = verify_certificate_chain(
+                    server_cert_chain,
+                    self.ca_public_key_pem,
+                    crl_pems=server_crls,
+                )
+                if not is_valid:
+                    print_error(f"[CRITICAL] Server chain không hợp lệ: {verify_msg}")
+                    sys.exit(1)
+
+                if self._extract_cn_from_cert_pem(server_cert_chain[0]) != "IAM-Server":
+                    print_error("[CRITICAL] Leaf certificate của server không có subject IAM-Server.")
                     sys.exit(1)
 
                 self.server_nonce = server_hello.get("server_nonce")
@@ -130,7 +227,8 @@ class IAMDemoClient:
                     print_error("LỖI: Server hello thiếu nonce hoặc signature.")
                     sys.exit(1)
 
-                self.server_public_key = extract_public_key(server_cert)
+                self.current_crls = server_crls
+                self.server_public_key = self._extract_public_key_from_chain(server_cert_chain)
                 server_hello_message = f"{self.server_nonce}|IAM-Server"
                 if not self.channel.verify_signature(server_hello_message, server_signature, self.server_public_key):
                     print_error("[CRITICAL] Server proof-of-possession không hợp lệ. Kết nối bị từ chối.")
@@ -211,9 +309,14 @@ class IAMDemoClient:
                     if req_type == "relayed_chat_msg":
                         self._handle_chat_message(data)
                         continue
-                    elif req_type == "peer_session_key":
+                    elif req_type in {"peer_session_key", "relay_session_key"}:
                         self._handle_peer_session_key(data)
                         continue
+
+                if req_type == "peer_joined":
+                    joined = data.get("username") or data.get("user_id") or "unknown"
+                    print(f"\n{Colors.OKCYAN}[INFO] {joined} vừa online.{Colors.ENDC}")
+                    continue
 
                 # Nếu là error mà in chat mode thì in ra
                 if req_type == "error" and self.in_chat_mode:
@@ -237,7 +340,8 @@ class IAMDemoClient:
             if not self.chat_session_key:
                 print(f"\n{Colors.WARNING}[CẢNH BÁO] Nhận được tin nhắn nhưng chưa có session key!{Colors.ENDC}")
                 return
-                
+            
+            # không nhận trực tiếp tin nhắn, chỉ nhận các thành phần cần mã hóa
             sender = data.get("sender_id")
             nonce = data.get("nonce", "")
             ciphertext = data.get("ciphertext", "")
@@ -253,10 +357,18 @@ class IAMDemoClient:
         try:
             encrypted_key = data.get("encrypted_key", "")
             signature = data.get("signature", "")
-            sender_cert = data.get("sender_cert", "")
+            sender_cert_chain = data.get("sender_cert_chain")
             sender_id = data.get("sender_id", "")
+            crls = data.get("crls") or self.current_crls
+
+            if not sender_cert_chain:
+                # Fallback cho payload legacy nếu có.
+                legacy_sender_cert = data.get("sender_cert") or {}
+                sender_cert_chain = legacy_sender_cert.get("chain_pems")
+                if not crls:
+                    crls = legacy_sender_cert.get("crls_pem") or []
             
-            if not signature or not sender_cert or not sender_id:
+            if not signature or not sender_cert_chain or not sender_id:
                 print(f"\n{Colors.FAIL}[LỖI MUTUAL AUTH] Gói tin Session Key thiếu Chữ ký hoặc Chứng chỉ từ {sender_id}. Bị từ chối!{Colors.ENDC}")
                 return
 
@@ -266,14 +378,25 @@ class IAMDemoClient:
                 
             # --- MUTUAL AUTH: XÁC THỰC SENDER TRƯỚC KHI TIN TƯỞNG PUBLIC KEY ---
             print(f"\n{Colors.OKCYAN}[MUTUAL AUTH] Đang xác minh chứng chỉ của {sender_id}...{Colors.ENDC}")
-            if not verify_certificate(sender_cert, self.ca_public_key_pem, expected_subject=sender_id):
+            is_valid_chain, chain_msg = verify_certificate_chain(
+                sender_cert_chain,
+                self.ca_public_key_pem,
+                crl_pems=crls,
+            )
+            if not is_valid_chain:
+                print(f"{Colors.FAIL}[LỖI MUTUAL AUTH] Sender chain không hợp lệ: {chain_msg}{Colors.ENDC}")
+                return
+
+            sender_subject = self._extract_cn_from_cert_pem(sender_cert_chain[0])
+            if sender_subject != sender_id:
+                print(f"{Colors.FAIL}[LỖI MUTUAL AUTH] Subject mismatch: expected={sender_id}, got={sender_subject}{Colors.ENDC}")
                 print(f"{Colors.FAIL}[LỖI MUTUAL AUTH] Chứng chỉ của {sender_id} KHÔNG HỢP LỆ! Từ chối nhận session key.{Colors.ENDC}")
                 return
             print(f"{Colors.OKGREEN}✓ Chứng chỉ của {sender_id} hợp lệ.{Colors.ENDC}")
             # --- END MUTUAL AUTH ---
                 
             # Trích xuất Public Key của người gửi từ Chứng chỉ đính kèm
-            peer_pub_key = extract_public_key(sender_cert)
+            peer_pub_key = self._extract_public_key_from_chain(sender_cert_chain)
             
             # Giải mã lấy Raw Session Key (vẫn dạng base64)
             key_b64 = self.channel.decrypt_rsa_oaep(encrypted_key, self.private_key)
@@ -373,13 +496,12 @@ class IAMDemoClient:
                         format=serialization.PrivateFormat.TraditionalOpenSSL,
                         encryption_algorithm=serialization.NoEncryption()
                     ))
-            
-            # Tự động cập nhật PKI Certificate ngầm định với CA mỗi khi login
-            # Để luôn public key mới nhất / hoặc có sẵn trên Server
-            self._sync_request({
-                "type": "cert_req",
-                "public_key": self._public_key_pem()
-            }, "cert_info")
+
+            if not self._perform_hello_csr():
+                print_error("Không thể hoàn tất hello/welcome với CSR. Hủy phiên đăng nhập.")
+                self.session_id = None
+                self.user_info = None
+                return
             # --- END FIX ---
 
     def do_register(self):
@@ -507,21 +629,45 @@ class IAMDemoClient:
             if not keys:
                 print("Chưa có khóa nào.")
             for k in keys:
-                active = "Hoạt động" if k['is_active'] else "Đã vô hiệu"
+                if k.get('is_expired'):
+                    active = "Hết hạn"
+                else:
+                    active = "Hoạt động" if k['is_active'] else "Đã vô hiệu"
                 print(f" • {k['key_id']} | {k['algorithm']} | {k['purpose']} | {active}")
 
     def do_cert_info(self):
         print_header("Chứng chỉ (Certificate)")
         res = self._sync_request({
-            "type": "cert_req",
-            "public_key": self._public_key_pem()
+            "type": "cert_req"
         }, "cert_info")
         if res:
-            cert = res.get("certificate", {})
-            # BỎ QUA CA Public Key từ network để tránh bị MITM
-            # self.ca_public_key_pem = res.get("ca_public_key")
-            print_success("Đã nhận chứng chỉ từ CA.")
-            print(json.dumps(cert, indent=2))
+            cert_chain = res.get("cert_chain") or []
+            crls = res.get("crls") or []
+
+            if not cert_chain:
+                print_error("Server không trả cert_chain.")
+                return
+
+            if not self.ca_public_key_pem:
+                print_error("Thiếu trusted root certificate để xác minh chain.")
+                return
+
+            is_valid, msg = verify_certificate_chain(
+                cert_chain,
+                self.ca_public_key_pem,
+                crl_pems=crls,
+            )
+            if is_valid:
+                print_success(f"Chứng chỉ hiện tại hợp lệ: {msg}")
+            else:
+                print_error(f"Chứng chỉ hiện tại không hợp lệ: {msg}")
+
+            print(json.dumps({
+                "subject": res.get("subject"),
+                "serial_number": res.get("serial_number"),
+                "cert_chain_len": len(cert_chain),
+                "crl_count": len(crls),
+            }, indent=2, ensure_ascii=False))
 
     def do_audit_logs(self):
         print_header("Audit Logs")
@@ -561,26 +707,39 @@ class IAMDemoClient:
         print("[1] Đang lấy Certificate của đối tác...")
         res = self._sync_request({
             "type": "relay",
-            "relay_type": "get_cert",
+            "relay_type": "cert_request",
             "target_id": target_uid
-        }, "peer_cert_response")
+        }, "cert_response")
         
         if not res:
             return
             
         resolved_target_id = res.get("target_id", target_uid)
-        cert = res.get("certificate")
+        cert_chain = res.get("cert_chain") or []
+        crls = res.get("crls") or []
         if not self.ca_public_key_pem:
             print_error("Thiếu public key của CA để xác minh!")
             return
-            
-        is_valid = verify_certificate(cert, self.ca_public_key_pem, expected_subject=resolved_target_id)
+
+        is_valid, verify_msg = verify_certificate_chain(
+            cert_chain,
+            self.ca_public_key_pem,
+            crl_pems=crls,
+        )
         if not is_valid:
+            print_error(f"Certificate chain KHÔNG HỢP LỆ: {verify_msg}")
+            print_error("Dừng kết nối.")
+            return
+
+        subject_cn = self._extract_cn_from_cert_pem(cert_chain[0])
+        if subject_cn != resolved_target_id:
+            print_error(f"Subject cert mismatch: expected={resolved_target_id}, got={subject_cn}")
             print_error("Certificate KHÔNG HỢP LỆ! Dừng kết nối.")
             return
             
         print_success("Certificate hợp lệ.")
-        self.chat_peer_public_key = extract_public_key(cert)
+        self.current_crls = crls
+        self.chat_peer_public_key = self._extract_public_key_from_chain(cert_chain)
         
         print("[2] Khởi tạo Key Exchange (RSA) và Ký hiệu (Digital Signature)...")
         self.chat_session_key = os.urandom(32)
@@ -597,7 +756,7 @@ class IAMDemoClient:
         
         self._send_req({
             "type": "relay",
-            "relay_type": "session_key",
+            "relay_type": "relay_session_key",
             "target_id": resolved_target_id,
             "encrypted_key": encrypted_key,
             "signature": signature

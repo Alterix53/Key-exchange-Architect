@@ -36,7 +36,7 @@ def clean_environment():
     except Exception as e:
         print(f"  - Lỗi khi dọn dẹp SQL Server: {e}")
     
-    dirs_to_clean = ["demo_identity", "demo_keys", "demo_audit", "data"]
+    dirs_to_clean = ["demo_identity", "demo_keys", "demo_audit", "data", "pki"]
     for d in dirs_to_clean:
         if os.path.exists(d):
             shutil.rmtree(d)
@@ -74,8 +74,12 @@ def setup_demo_environment():
 
     # 3. Tạo certificate authority (CA)
     print("\n3️⃣  Đang khởi tạo Hệ thống PKI / CA...")
-    ca = CertificateAuthority(data_dir="data")
-    print(f"  ✓ Root CA Key Pair & Certificate đã được sinh. (data/ca_private.pem, data/ca_public.pem)")
+    ca = CertificateAuthority(data_dir="pki")
+    print("  ✓ Root/Intermediate CA artifacts đã được sinh trong pki/")
+    print("    - pki/root/private/root.key")
+    print("    - pki/root/certs/root.crt")
+    print("    - pki/intermediate/private/intermediate.key")
+    print("    - pki/intermediate/certs/intermediate.crt")
     audit.log_event(AuditEventType.KEY_GENERATED, "system", "pki", "init_ca")
 
     # 4. Sinh khóa đối xứng mấu (Mocking)
