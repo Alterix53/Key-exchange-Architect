@@ -8,8 +8,9 @@ from .identity_management import IdentityManagementSystem, Role, Permission
 from .secure_transmission import SecureTransmissionChannel, SecureMessage
 from .audit_logging import AuditLogger, AuditEventType
 from .storage_backend import (
-    UserStorage, KeyStorage, AuditStorage,
-    SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage
+    UserStorage, KeyStorage, AuditStorage, SessionStorage, KdcTicketStorage,
+    SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage,
+    SqlServerSessionStorage, SqlServerKdcTicketStorage,
 )
 from typing import Optional
 import os

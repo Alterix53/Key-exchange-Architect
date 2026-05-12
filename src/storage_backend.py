@@ -112,6 +112,42 @@ class AuditStorage(ABC):
         pass
 
 
+class SessionStorage(ABC):
+    """Interface cho lưu trữ session"""
+
+    @abstractmethod
+    def save_session(self, session_dict: Dict) -> None:
+        pass
+
+    @abstractmethod
+    def load_active_sessions(self) -> List[Dict]:
+        pass
+
+    @abstractmethod
+    def deactivate_session(self, session_id: str) -> None:
+        pass
+
+
+class KdcTicketStorage(ABC):
+    """Interface cho lưu trữ KDC tickets"""
+
+    @abstractmethod
+    def save_ticket(self, ticket_dict: Dict) -> None:
+        pass
+
+    @abstractmethod
+    def load_ticket(self, ticket_id: str) -> Optional[Dict]:
+        pass
+
+    @abstractmethod
+    def mark_used(self, ticket_id: str) -> None:
+        pass
+
+    @abstractmethod
+    def load_all_tickets(self) -> Dict[str, Dict]:
+        pass
+
+
 # ============================================================
 #  SQL Server Stub — Placeholder cho tương lai
 #  Cài đặt: pip install pyodbc
@@ -194,6 +230,7 @@ class SqlServerUserStorage(UserStorage):
         
         users = []
         for row in cursor.fetchall():
+            status = row.status or 'active'
             user_dict = {
                 'user_id': row.user_id,
                 'username': row.username,
@@ -202,7 +239,8 @@ class SqlServerUserStorage(UserStorage):
                 'roles': json.loads(row.roles),
                 'mfa_secret': row.mfa_secret,
                 'mfa_enabled': bool(row.mfa_enabled),
-                'status': row.status,
+                'status': status,
+                'is_active': (status == 'active'),
                 'created_at': row.created_at.isoformat() if row.created_at else None,
                 'last_login': row.last_login.isoformat() if row.last_login else None
             }
@@ -254,15 +292,28 @@ class SqlServerKeyStorage(KeyStorage):
     def load_or_create_master_key(self) -> bytes:
         import pyodbc
         import secrets
+        from .security_config import (
+            is_secure_mode, wrap_master_key, unwrap_master_key,
+        )
         conn = pyodbc.connect(self.connection_string, autocommit=True)
         cursor = conn.cursor()
         cursor.execute("SELECT key_payload FROM KeysData WHERE key_id = 'master_key' AND key_type = 'master'")
         row = cursor.fetchone()
         if row:
-            master_key = row.key_payload
+            master_key = unwrap_master_key(bytes(row.key_payload))
         else:
+            if is_secure_mode():
+                raise RuntimeError(
+                    "IAM_SECURITY_MODE=secure nhưng master key chưa tồn tại trong DB. "
+                    "Cần khởi tạo master key trước (chạy init_demo_env.py ở chế độ demo, "
+                    "sau đó migrate sang secure mode)."
+                )
             master_key = secrets.token_bytes(32)
-            cursor.execute("INSERT INTO KeysData (key_id, key_type, key_payload) VALUES ('master_key', 'master', ?)", master_key)
+            wrapped = wrap_master_key(master_key)
+            cursor.execute(
+                "INSERT INTO KeysData (key_id, key_type, key_payload) VALUES ('master_key', 'master', ?)",
+                wrapped,
+            )
         conn.close()
         return master_key
 
@@ -459,3 +510,139 @@ class SqlServerAuditStorage(AuditStorage):
                     writer.writeheader()
                     writer.writerows(logs)
         return output_file
+
+
+class SqlServerSessionStorage(SessionStorage):
+    """Lưu trữ session bằng SQL Server."""
+
+    def __init__(self, connection_string: str):
+        self.connection_string = connection_string
+
+    def save_session(self, s: Dict) -> None:
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM Sessions WHERE session_id = ?", s['session_id'])
+        if cursor.fetchone():
+            cursor.execute('''
+                UPDATE Sessions SET is_active = ?, mfa_verified = ?
+                WHERE session_id = ?
+            ''', (s.get('is_active', True), s.get('mfa_verified', False), s['session_id']))
+        else:
+            cursor.execute('''
+                INSERT INTO Sessions (session_id, user_id, created_at, expires_at,
+                    is_active, ip_address, user_agent, mfa_verified)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                s['session_id'], s['user_id'], s.get('created_at'),
+                s['expires_at'], s.get('is_active', True),
+                s.get('ip_address'), s.get('user_agent'),
+                s.get('mfa_verified', False),
+            ))
+        conn.close()
+
+    def load_active_sessions(self) -> List[Dict]:
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT session_id, user_id, created_at, expires_at, is_active, "
+            "ip_address, user_agent, mfa_verified FROM Sessions WHERE is_active = 1"
+        )
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                'session_id': row.session_id,
+                'user_id': row.user_id,
+                'created_at': row.created_at.isoformat() if row.created_at else None,
+                'expires_at': row.expires_at.isoformat() if row.expires_at else None,
+                'is_active': bool(row.is_active),
+                'ip_address': row.ip_address,
+                'user_agent': row.user_agent,
+                'mfa_verified': bool(row.mfa_verified),
+            })
+        conn.close()
+        return results
+
+    def deactivate_session(self, session_id: str) -> None:
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE Sessions SET is_active = 0 WHERE session_id = ?", session_id)
+        conn.close()
+
+
+class SqlServerKdcTicketStorage(KdcTicketStorage):
+    """Lưu trữ KDC ticket bằng SQL Server."""
+
+    def __init__(self, connection_string: str):
+        self.connection_string = connection_string
+
+    def save_ticket(self, t: Dict) -> None:
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM KdcTickets WHERE ticket_id = ?", t['ticket_id'])
+        if cursor.fetchone():
+            cursor.execute(
+                "UPDATE KdcTickets SET used = ? WHERE ticket_id = ?",
+                (t.get('used', False), t['ticket_id']),
+            )
+        else:
+            cursor.execute('''
+                INSERT INTO KdcTickets (ticket_id, ks_b64, ida, idb, issued_at, expires_at, used)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                t['ticket_id'], t['ks'], t['ida'], t['idb'],
+                t.get('issued_at'), t['expires_at'], t.get('used', False),
+            ))
+        conn.close()
+
+    def load_ticket(self, ticket_id: str) -> Optional[Dict]:
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT ticket_id, ks_b64, ida, idb, issued_at, expires_at, used "
+            "FROM KdcTickets WHERE ticket_id = ?", ticket_id,
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            'ticket_id': row.ticket_id,
+            'ks': row.ks_b64,
+            'ida': row.ida,
+            'idb': row.idb,
+            'issued_at': row.issued_at.isoformat() if row.issued_at else None,
+            'expires_at': row.expires_at.isoformat() if row.expires_at else None,
+            'used': bool(row.used),
+        }
+
+    def mark_used(self, ticket_id: str) -> None:
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE KdcTickets SET used = 1 WHERE ticket_id = ?", ticket_id)
+        conn.close()
+
+    def load_all_tickets(self) -> Dict[str, Dict]:
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT ticket_id, ks_b64, ida, idb, issued_at, expires_at, used FROM KdcTickets"
+        )
+        tickets = {}
+        for row in cursor.fetchall():
+            tickets[row.ticket_id] = {
+                'ks': row.ks_b64,
+                'ida': row.ida,
+                'idb': row.idb,
+                'issued_at': row.issued_at.isoformat() if row.issued_at else None,
+                'expires_at': row.expires_at.isoformat() if row.expires_at else None,
+                'used': bool(row.used),
+            }
+        conn.close()
+        return tickets

@@ -226,15 +226,26 @@ class KeyStore:
         """Lưu khóa công khai RSA"""
         self.storage.save_public_key_bytes(key_id, public_key)
     
-    def get_symmetric_key(self, key_id: str) -> Optional[bytes]:
-        """Lấy khóa đối xứng"""
+    def _validate_key_usable(self, key_id: str) -> 'KeyMetadata':
+        """Kiểm tra key tồn tại, chưa hết hạn, và chưa bị thu hồi."""
         if key_id not in self.keys_metadata:
             self._load_metadata(key_id)
-        
+
         metadata = self.keys_metadata.get(key_id)
-        if not metadata or metadata.is_expired():
-            raise ValueError(f"Khóa {key_id} hết hạn hoặc không tồn tại")
-        
+        if not metadata:
+            raise ValueError(f"Khóa {key_id} không tồn tại")
+        if not metadata.is_active:
+            raise ValueError(f"Khóa {key_id} đã bị thu hồi (revoked/inactive)")
+        if metadata.is_expired():
+            metadata.is_active = False
+            self.storage.save_metadata(key_id, metadata.to_dict())
+            raise ValueError(f"Khóa {key_id} đã hết hạn")
+        return metadata
+
+    def get_symmetric_key(self, key_id: str) -> Optional[bytes]:
+        """Lấy khóa đối xứng"""
+        self._validate_key_usable(key_id)
+
         encrypted_key = self.storage.load_key_bytes(key_id)
         if encrypted_key is None:
             return None
@@ -243,12 +254,7 @@ class KeyStore:
     
     def get_private_key(self, key_id: str, private_key_password: Optional[str] = None):
         """Lấy khóa riêng RSA"""
-        if key_id not in self.keys_metadata:
-            self._load_metadata(key_id)
-        
-        metadata = self.keys_metadata.get(key_id)
-        if not metadata or metadata.is_expired():
-            raise ValueError(f"Khóa {key_id} hết hạn hoặc không tồn tại")
+        self._validate_key_usable(key_id)
         
         encrypted_key = self.storage.load_private_key_bytes(key_id)
         if encrypted_key is None:
@@ -347,9 +353,10 @@ class KeyStore:
             self.generate_symmetric_key(new_key_id, metadata.owner, 
                                        metadata.purpose, metadata.algorithm)
         
-        # Đánh dấu khóa cũ không còn hoạt động
+        # Đánh dấu khóa cũ không còn hoạt động và persist ngay
         metadata.is_active = False
         metadata.last_rotated = datetime.now()
+        self.storage.save_metadata(key_id, metadata.to_dict())
         
         return new_key_id
     

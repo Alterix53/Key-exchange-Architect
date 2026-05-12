@@ -409,5 +409,136 @@ class TestAuditLogging(LoggedTestCase):
         self.assertEqual(report["permissions_denied"], 1)
 
 
+class TestSecurityConfig(LoggedTestCase):
+    """Test security_config module (Phase 1 — secret protection)."""
+
+    def test_wrap_unwrap_roundtrip(self):
+        """wrap_master_key + unwrap_master_key produce original key."""
+        os.environ["IAM_MASTER_KEY_PASSPHRASE"] = "test-passphrase-42"
+        try:
+            from src.security_config import wrap_master_key, unwrap_master_key
+            original = os.urandom(32)
+            wrapped = wrap_master_key(original)
+            self.assertTrue(wrapped.startswith(b"WRAP1"))
+            self.assertNotEqual(wrapped, original)
+            recovered = unwrap_master_key(wrapped)
+            self.assertEqual(original, recovered)
+        finally:
+            os.environ.pop("IAM_MASTER_KEY_PASSPHRASE", None)
+
+    def test_unwrap_plaintext_passthrough_demo_mode(self):
+        """In demo mode (no passphrase), unwrap returns raw bytes unchanged."""
+        os.environ.pop("IAM_MASTER_KEY_PASSPHRASE", None)
+        os.environ["IAM_SECURITY_MODE"] = "demo"
+        try:
+            from src.security_config import unwrap_master_key
+            raw = os.urandom(32)
+            self.assertEqual(unwrap_master_key(raw), raw)
+        finally:
+            os.environ.pop("IAM_SECURITY_MODE", None)
+
+    def test_secure_mode_requires_passphrase(self):
+        """Secure mode raises when IAM_MASTER_KEY_PASSPHRASE is missing."""
+        os.environ["IAM_SECURITY_MODE"] = "secure"
+        os.environ.pop("IAM_MASTER_KEY_PASSPHRASE", None)
+        try:
+            from src.security_config import get_master_key_passphrase
+            with self.assertRaises(RuntimeError):
+                get_master_key_passphrase()
+        finally:
+            os.environ.pop("IAM_SECURITY_MODE", None)
+
+
+class TestUserStatusConsistency(LoggedTestCase):
+    """Test Phase 2 — user status/MFA persistence consistency."""
+
+    def setUp(self):
+        super().setUp()
+        self.test_path = "test_user_consistency"
+        if os.path.exists(self.test_path):
+            shutil.rmtree(self.test_path)
+        self.iam = IdentityManagementSystem(self.test_path)
+
+    def tearDown(self):
+        if os.path.exists(self.test_path):
+            shutil.rmtree(self.test_path)
+        super().tearDown()
+
+    def test_to_dict_includes_status_field(self):
+        """User.to_dict() emits 'status' mapped from is_active."""
+        user = self.iam.create_user("statususer", "s@e.com", "pass123")
+        d = user.to_dict()
+        self.assertEqual(d['status'], 'active')
+        self.assertTrue(d['is_active'])
+
+    def test_deactivate_sets_status_inactive(self):
+        """After deactivate, to_dict returns status='inactive'."""
+        user = self.iam.create_user("deactuser", "d@e.com", "pass123")
+        self.iam.deactivate_user(user.user_id)
+        d = self.iam.users[user.user_id].to_dict()
+        self.assertEqual(d['status'], 'inactive')
+        self.assertFalse(d['is_active'])
+
+    def test_deactivated_user_cannot_login(self):
+        user = self.iam.create_user("noauth", "n@e.com", "pass123")
+        self.iam.deactivate_user(user.user_id)
+        session = self.iam.authenticate_user("noauth", "pass123")
+        self.assertIsNone(session)
+
+    def test_enable_mfa_persists_secret(self):
+        """enable_mfa stores mfa_secret on User object."""
+        user = self.iam.create_user("mfauser", "m@e.com", "pass123")
+        secret = self.iam.enable_mfa(user.user_id)
+        self.assertIsNotNone(secret)
+        self.assertEqual(user.mfa_secret, secret)
+        self.assertTrue(user.mfa_enabled)
+
+
+class TestKeyLifecycleGuard(LoggedTestCase):
+    """Test Phase 3 — revoked/expired key access denied."""
+
+    def setUp(self):
+        super().setUp()
+        self.test_path = "test_key_lifecycle"
+        if os.path.exists(self.test_path):
+            shutil.rmtree(self.test_path)
+        self.key_store = KeyStore(self.test_path)
+
+    def tearDown(self):
+        if os.path.exists(self.test_path):
+            shutil.rmtree(self.test_path)
+        super().tearDown()
+
+    def test_revoked_symmetric_key_access_denied(self):
+        """After revoke, get_symmetric_key should raise ValueError."""
+        key_id = self.key_store.generate_symmetric_key(
+            "revoke_guard_test", "alice", "Test"
+        )
+        self.key_store.revoke_key(key_id)
+        with self.assertRaises(ValueError) as ctx:
+            self.key_store.get_symmetric_key(key_id)
+        self.assertIn("thu hồi", str(ctx.exception).lower().replace("đã bị ", ""))
+
+    def test_revoked_private_key_access_denied(self):
+        """After revoke, get_private_key should raise ValueError."""
+        key_id, _, _ = self.key_store.generate_asymmetric_key_pair(
+            "revoke_rsa_guard", "alice", "Test"
+        )
+        self.key_store.revoke_key(key_id)
+        with self.assertRaises(ValueError):
+            self.key_store.get_private_key(key_id)
+
+    def test_rotate_persists_old_key_inactive(self):
+        """After rotate, old key's is_active is persisted to storage."""
+        key_id = self.key_store.generate_symmetric_key(
+            "rotate_persist_test", "alice", "Test"
+        )
+        new_key_id = self.key_store.rotate_key(key_id)
+        meta = self.key_store.storage.load_metadata(key_id)
+        self.assertFalse(meta['is_active'])
+        new_key = self.key_store.get_symmetric_key(new_key_id)
+        self.assertIsNotNone(new_key)
+
+
 if __name__ == '__main__':
     unittest.main()

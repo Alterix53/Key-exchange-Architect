@@ -92,3 +92,47 @@ BEGIN
     CREATE NONCLUSTERED INDEX IX_AuditLogs_Timestamp ON AuditLogs(timestamp DESC);
 END
 GO
+
+----------------------------------------------------------------------
+-- 4. Sessions (Phiên đăng nhập)
+----------------------------------------------------------------------
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'Sessions')
+BEGIN
+    CREATE TABLE Sessions (
+        session_id     VARCHAR(100)   NOT NULL PRIMARY KEY,
+        user_id        VARCHAR(50)    NOT NULL,
+        created_at     DATETIME2      NOT NULL DEFAULT GETDATE(),
+        expires_at     DATETIME2      NOT NULL,
+        is_active      BIT            NOT NULL DEFAULT 1,
+        ip_address     VARCHAR(45)    NULL,
+        user_agent     NVARCHAR(500)  NULL,
+        mfa_verified   BIT            NOT NULL DEFAULT 0,
+
+        CONSTRAINT FK_Sessions_Users FOREIGN KEY (user_id)
+            REFERENCES Users(user_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IX_Sessions_UserId ON Sessions(user_id);
+    CREATE INDEX IX_Sessions_ExpiresAt ON Sessions(expires_at);
+END
+GO
+
+----------------------------------------------------------------------
+-- 5. KDC Tickets
+----------------------------------------------------------------------
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'KdcTickets')
+BEGIN
+    CREATE TABLE KdcTickets (
+        ticket_id      VARCHAR(100)   NOT NULL PRIMARY KEY,
+        ks_b64         VARCHAR(500)   NOT NULL,
+        ida            VARCHAR(50)    NOT NULL,
+        idb            VARCHAR(50)    NOT NULL,
+        issued_at      DATETIME2      NOT NULL DEFAULT GETDATE(),
+        expires_at     DATETIME2      NOT NULL,
+        used           BIT            NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IX_KdcTickets_Idb ON KdcTickets(idb);
+    CREATE INDEX IX_KdcTickets_ExpiresAt ON KdcTickets(expires_at);
+END
+GO

@@ -15,13 +15,16 @@ Thành phần:
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, TYPE_CHECKING
 
 from cryptography import x509
 from cryptography.x509.oid import NameOID, ExtensionOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.exceptions import InvalidSignature
+
+if TYPE_CHECKING:
+    from .audit_logging import AuditLogger
 
 
 # =============================================================================
@@ -115,15 +118,18 @@ class RootCA:
     """
 
     def __init__(self, data_dir: str = "pki_data", cn: str = "IAM Root CA",
-                 org: str = "IAM Security System", validity_years: int = 10):
+                 org: str = "IAM Security System", validity_years: int = 10,
+                 audit_logger: Optional['AuditLogger'] = None):
         """ Khởi tạo Root CA. Nếu đã tồn tại thì tải lên, nếu không thì tạo mới.
         Args:
             data_dir: Thư mục lưu trữ dữ liệu PKI
             cn: Common Name cho Root CA
             org: Organization Name cho Root CA
             validity_years: Số năm hiệu lực của Root CA
+            audit_logger: Optional AuditLogger để ghi log các sự kiện PKI
         """
         self.data_dir = data_dir
+        self.audit_logger = audit_logger
         os.makedirs(data_dir, exist_ok=True)
 
         self.private_dir = os.path.join(data_dir, "root", "private")
@@ -139,8 +145,12 @@ class RootCA:
 
         if os.path.exists(self.ca_key_path) and os.path.exists(self.ca_cert_path):
             # Load existing Root CA
+            from .security_config import get_pki_key_passphrase
+            passphrase = get_pki_key_passphrase()
             with open(self.ca_key_path, "rb") as f:
-                self.private_key = serialization.load_pem_private_key(f.read(), password=None)
+                self.private_key = serialization.load_pem_private_key(
+                    f.read(), password=passphrase,
+                )
             self.certificate = load_cert_from_pem_file(self.ca_cert_path)
             self._load_crl()
             print(f"[Root CA] Đã tải Root CA từ {data_dir}")
@@ -252,6 +262,24 @@ class RootCA:
         self._revoked_serials.append((serial_number, datetime.utcnow()))
         self._generate_crl()
         print(f"[Root CA] Đã thu hồi certificate serial={format(serial_number, 'x')[:16]}...")
+        
+        if self.audit_logger:
+            try:
+                from .audit_logging import AuditEventType
+                self.audit_logger.log_event(
+                    AuditEventType.CERT_REVOKED,
+                    "system",
+                    "pki",
+                    "revoke",
+                    "success",
+                    details={
+                        "ca_level": "root",
+                        "serial_number": format(serial_number, "x")[:16],
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                )
+            except Exception as e:
+                print(f"[Root CA] ⚠ Lỗi ghi audit log: {e}")
 
     def _generate_crl(self):
         """Sinh CRL (Certificate Revocation List) và lưu ra file."""
@@ -317,8 +345,9 @@ class IntermediateCA:
 
     def __init__(self, root_ca: RootCA, data_dir: str = "pki_data",
                  cn: str = "IAM Intermediate CA", org: str = "IAM Security System",
-                 validity_years: int = 5):
+                 validity_years: int = 5, audit_logger: Optional['AuditLogger'] = None):
         self.data_dir = data_dir
+        self.audit_logger = audit_logger
 
         self.private_dir = os.path.join(data_dir, "intermediate", "private")
         self.certs_dir = os.path.join(data_dir, "intermediate", "certs")
@@ -332,8 +361,12 @@ class IntermediateCA:
         self._revoked_serials: List[Tuple[int, datetime]] = []
 
         if os.path.exists(self.ca_key_path) and os.path.exists(self.ca_cert_path):
+            from .security_config import get_pki_key_passphrase
+            passphrase = get_pki_key_passphrase()
             with open(self.ca_key_path, "rb") as f:
-                self.private_key = serialization.load_pem_private_key(f.read(), password=None)
+                self.private_key = serialization.load_pem_private_key(
+                    f.read(), password=passphrase,
+                )
             self.certificate = load_cert_from_pem_file(self.ca_cert_path)
             self._load_crl()
             print(f"[Intermediate CA] Đã tải Intermediate CA từ {data_dir}")
@@ -417,6 +450,27 @@ class IntermediateCA:
 
         cert = builder.sign(self.private_key, hashes.SHA256())
         print(f"[Intermediate CA] Đã cấp certificate cho: {subject_cn}")
+        
+        if self.audit_logger:
+            try:
+                from .audit_logging import AuditEventType
+                self.audit_logger.log_event(
+                    AuditEventType.CERT_ISSUED,
+                    subject_cn,
+                    "pki",
+                    "issue_cert",
+                    "success",
+                    details={
+                        "serial_number": format(cert.serial_number, "x")[:16],
+                        "subject_cn": subject_cn,
+                        "cert_type": "server" if is_server else "client",
+                        "validity_days": validity_days,
+                        "not_valid_after": cert.not_valid_after_utc.isoformat()
+                    }
+                )
+            except Exception as e:
+                print(f"[Intermediate CA] ⚠ Lỗi ghi audit log: {e}")
+        
         return cert
 
     def revoke_certificate(self, serial_number: int):
@@ -424,6 +478,24 @@ class IntermediateCA:
         self._revoked_serials.append((serial_number, datetime.utcnow()))
         self._generate_crl()
         print(f"[Intermediate CA] Đã thu hồi certificate serial={format(serial_number, 'x')[:16]}...")
+        
+        if self.audit_logger:
+            try:
+                from .audit_logging import AuditEventType
+                self.audit_logger.log_event(
+                    AuditEventType.CERT_REVOKED,
+                    "system",
+                    "pki",
+                    "revoke",
+                    "success",
+                    details={
+                        "ca_level": "intermediate",
+                        "serial_number": format(serial_number, "x")[:16],
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                )
+            except Exception as e:
+                print(f"[Intermediate CA] ⚠ Lỗi ghi audit log: {e}")
 
     def _generate_crl(self):
         now = datetime.utcnow()
@@ -486,9 +558,11 @@ class RegistrationAuthority:
     """
 
     def __init__(self, intermediate_ca: IntermediateCA,
-                 repository: CertificateRepository):
+                 repository: CertificateRepository,
+                 audit_logger: Optional['AuditLogger'] = None):
         self.ca = intermediate_ca
         self.repository = repository
+        self.audit_logger = audit_logger
 
     def process_csr(self, csr: x509.CertificateSigningRequest,
                     is_server: bool = False,
@@ -501,10 +575,43 @@ class RegistrationAuthority:
         """
         subject_cn = _get_cn(csr.subject)
         print(f"[RA] Nhận CSR từ: {subject_cn}")
+        
+        if self.audit_logger:
+            try:
+                from .audit_logging import AuditEventType
+                self.audit_logger.log_event(
+                    AuditEventType.CERT_CSR_RECEIVED,
+                    subject_cn,
+                    "pki",
+                    "receive_csr",
+                    "success",
+                    details={
+                        "subject_cn": subject_cn,
+                        "cert_type": "server" if is_server else "client"
+                    }
+                )
+            except Exception as e:
+                print(f"[RA] ⚠ Lỗi ghi audit log (CSR received): {e}")
 
         # === Bước 1: Verify CSR signature (chứng minh sở hữu private key) ===
         if not _verify_csr_signature(csr, raise_on_fail=False):
             print(f"[RA] ❌ CSR signature không hợp lệ! Từ chối.")
+            if self.audit_logger:
+                try:
+                    from .audit_logging import AuditEventType
+                    self.audit_logger.log_event(
+                        AuditEventType.CERT_VERIFICATION_FAILED,
+                        subject_cn,
+                        "pki",
+                        "verify_csr",
+                        "failed",
+                        details={
+                            "reason": "Invalid CSR signature",
+                            "subject_cn": subject_cn
+                        }
+                    )
+                except Exception as e:
+                    print(f"[RA] ⚠ Lỗi ghi audit log (CSR verification failed): {e}")
             return None
 
         print(f"[RA] ✓ CSR signature hợp lệ (client chứng minh sở hữu private key)")
@@ -545,6 +652,20 @@ class RegistrationAuthority:
         """
         subject_cn = _get_cn(csr.subject)
         print(f"[RA] Yêu cầu gia hạn certificate cho: {subject_cn}")
+        
+        if self.audit_logger:
+            try:
+                from .audit_logging import AuditEventType
+                self.audit_logger.log_event(
+                    AuditEventType.CERT_RENEWED,
+                    subject_cn,
+                    "pki",
+                    "renew_cert",
+                    "success",
+                    details={"subject_cn": subject_cn}
+                )
+            except Exception as e:
+                print(f"[RA] ⚠ Lỗi ghi audit log (renewal): {e}")
 
         # Thu hồi cert cũ nếu có
         existing = self.repository.get_certificate(subject_cn)
@@ -568,6 +689,25 @@ class RegistrationAuthority:
         self.ca.revoke_certificate(existing.serial_number)
         self.repository.remove_certificate(subject_cn)
         print(f"[RA] ✓ Đã thu hồi certificate cho: {subject_cn}")
+        
+        if self.audit_logger:
+            try:
+                from .audit_logging import AuditEventType
+                self.audit_logger.log_event(
+                    AuditEventType.CERT_REVOKED,
+                    subject_cn,
+                    "pki",
+                    "revoke",
+                    "success",
+                    details={
+                        "subject_cn": subject_cn,
+                        "serial_number": format(existing.serial_number, "x")[:16],
+                        "revocation_time": datetime.utcnow().isoformat()
+                    }
+                )
+            except Exception as e:
+                print(f"[RA] ⚠ Lỗi ghi audit log (revocation): {e}")
+        
         return True
 
 
@@ -581,8 +721,9 @@ class PKISystem:
     Tạo 1 instance duy nhất trên server để quản lý toàn bộ PKI.
     """
 
-    def __init__(self, data_dir: str = "pki"):
+    def __init__(self, data_dir: str = "pki", audit_logger: Optional['AuditLogger'] = None):
         self.data_dir = data_dir
+        self.audit_logger = audit_logger
         os.makedirs(data_dir, exist_ok=True)
 
         print("=" * 60)
@@ -593,17 +734,17 @@ class PKISystem:
         self.repository = CertificateRepository(data_dir)
 
         # 2. Root CA
-        self.root_ca = RootCA(data_dir)
+        self.root_ca = RootCA(data_dir, audit_logger=audit_logger)
 
         # 3. Intermediate CA (signed by Root)
-        self.intermediate_ca = IntermediateCA(self.root_ca, data_dir)
+        self.intermediate_ca = IntermediateCA(self.root_ca, data_dir, audit_logger=audit_logger)
 
         # Store CA certs vào repository
         self.repository.store_certificate(self.root_ca.certificate, "Root CA")
         self.repository.store_certificate(self.intermediate_ca.certificate, "Intermediate CA")
 
         # 4. Registration Authority
-        self.ra = RegistrationAuthority(self.intermediate_ca, self.repository)
+        self.ra = RegistrationAuthority(self.intermediate_ca, self.repository, audit_logger=audit_logger)
 
         print("=" * 60)
         print("  PKI đã sẵn sàng.")
@@ -648,6 +789,47 @@ class PKISystem:
     def lookup(self, subject_cn: str) -> Optional[x509.Certificate]:
         """Tra cứu certificate trong repository."""
         return self.repository.get_certificate(subject_cn)
+    
+    def verify_cert_chain_with_audit(self, cert_chain_pems: List[str],
+                                      trusted_root_pem: str,
+                                      crl_pems: Optional[List[str]] = None) -> Tuple[bool, str]:
+        """
+        Xác thực certificate chain với audit logging.
+        
+        Returns:
+            (is_valid, message)
+        """
+        is_valid, message = verify_certificate_chain(cert_chain_pems, trusted_root_pem, crl_pems)
+        
+        if self.audit_logger and len(cert_chain_pems) > 0:
+            try:
+                from .audit_logging import AuditEventType
+                
+                # Get cert subject for logging
+                try:
+                    cert = x509.load_pem_x509_certificate(cert_chain_pems[0].encode("utf-8"))
+                    subject_cn = _get_cn(cert.subject)
+                except:
+                    subject_cn = "unknown"
+                
+                event_type = AuditEventType.CERT_CHAIN_VALIDATED if is_valid else AuditEventType.CERT_CHAIN_VALIDATION_FAILED
+                self.audit_logger.log_event(
+                    event_type,
+                    "system",
+                    "pki",
+                    "verify_chain",
+                    "success" if is_valid else "failed",
+                    details={
+                        "subject_cn": subject_cn,
+                        "is_valid": is_valid,
+                        "message": message,
+                        "chain_length": len(cert_chain_pems)
+                    }
+                )
+            except Exception as e:
+                print(f"[PKI] ⚠ Lỗi ghi audit log (chain verification): {e}")
+        
+        return is_valid, message
 
 
 # =============================================================================
@@ -872,14 +1054,25 @@ def _verify_csr_signature(csr: x509.CertificateSigningRequest,
 
 
 def _save_private_key(key, path: str):
-    """Lưu private key ra file PEM."""
+    """Lưu private key ra file PEM, mã hóa bằng passphrase nếu có."""
+    from .security_config import get_pki_key_passphrase
+
+    passphrase = get_pki_key_passphrase()
+    if passphrase is not None:
+        enc_algo = serialization.BestAvailableEncryption(passphrase)
+    else:
+        enc_algo = serialization.NoEncryption()
+
     with open(path, "wb") as f:
         f.write(key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
+            encryption_algorithm=enc_algo,
         ))
-    os.chmod(path, 0o600)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def _save_certificate(cert: x509.Certificate, path: str):

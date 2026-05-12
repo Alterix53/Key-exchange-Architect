@@ -132,7 +132,6 @@ Demo minh họa toàn bộ PKI lifecycle mà không cần mở server/client:
 ---
 
 ## Cấu trúc thư mục
-
 ```
 Key-exchange-Architect/
 ├── server.py                          # Relay server + PKI

@@ -12,7 +12,7 @@ import os
 import sys
 import secrets
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 
 from cryptography.hazmat.primitives import serialization
@@ -23,10 +23,11 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.identity_management import IdentityManagementSystem, Role, Permission
 from src.key_management import KeyStore
 from src.audit_logging import AuditLogger, AuditEventType
+from src.pki_client import PKIClient
 from src.public_key_distribution import (
-    PKISystem,
     create_csr,
     load_csr_from_pem,
+    load_cert_from_pem,
     serialize_cert_to_pem,
 )
 from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
@@ -70,18 +71,25 @@ class IAMBackendServer:
         print("[INIT] Đang tải các phân hệ IAM (Backend: sqlserver)...")
 
         from src.db import get_working_connection_string
-        from src.storage_backend import SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage
+        from src.storage_backend import (
+            SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage,
+            SqlServerSessionStorage, SqlServerKdcTicketStorage,
+        )
         conn_str = get_working_connection_string()
 
         user_storage = SqlServerUserStorage(conn_str)
         key_storage = SqlServerKeyStorage(conn_str)
         audit_storage = SqlServerAuditStorage(conn_str)
+        session_storage = SqlServerSessionStorage(conn_str)
+        self._kdc_ticket_storage = SqlServerKdcTicketStorage(conn_str)
 
-        self.iam = IdentityManagementSystem("demo_identity", storage=user_storage)
+        self.iam = IdentityManagementSystem(
+            "demo_identity", storage=user_storage, session_storage=session_storage,
+        )
         self.key_store = KeyStore("demo_keys", storage=key_storage)
         self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
 
-        self.pki = PKISystem(data_dir="pki")
+        self.pki = PKIClient()
         
         # --- MUTUAL AUTH: Khởi tạo Server Identity ---
         server_dir = os.path.join("pki", "server")
@@ -89,32 +97,61 @@ class IAMBackendServer:
         server_priv_path = os.path.join(server_dir, "server_private.pem")
         server_cert_path = os.path.join(server_dir, "server_cert.pem")
 
+        from src.security_config import get_pki_key_passphrase
+        pki_passphrase = get_pki_key_passphrase()
+
         if os.path.exists(server_priv_path):
             with open(server_priv_path, "rb") as f:
-                self.server_private_key = serialization.load_pem_private_key(f.read(), password=None)
+                self.server_private_key = serialization.load_pem_private_key(
+                    f.read(), password=pki_passphrase,
+                )
             print("[SERVER] Đã tải Server Private Key từ file.")
         else:
             print("[SERVER] Khởi tạo Server Private Key mới...")
             self.server_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            enc_algo = (
+                serialization.BestAvailableEncryption(pki_passphrase)
+                if pki_passphrase
+                else serialization.NoEncryption()
+            )
             with open(server_priv_path, "wb") as f:
                 f.write(self.server_private_key.private_bytes(
                     encoding=serialization.Encoding.PEM,
                     format=serialization.PrivateFormat.TraditionalOpenSSL,
-                    encryption_algorithm=serialization.NoEncryption()
+                    encryption_algorithm=enc_algo,
                 ))
+            try:
+                os.chmod(server_priv_path, 0o600)
+            except OSError:
+                pass
 
-        # Luôn cấp/re-cấp server cert qua CSR để đi đúng flow RA -> Intermediate CA.
-        server_csr = create_csr("IAM-Server", "IAM Security System", self.server_private_key)
-        server_cert = self.pki.issue_cert_from_csr(server_csr, is_server=True)
+        # Tải cert hiện có nếu còn hạn, chỉ cấp mới khi cần.
+        server_cert = None
+        if os.path.exists(server_cert_path):
+            try:
+                with open(server_cert_path, "r", encoding="utf-8") as f:
+                    existing_pem = f.read()
+                existing_cert = load_cert_from_pem(existing_pem)
+                if existing_cert.not_valid_after_utc > datetime.now(timezone.utc):
+                    server_cert = existing_cert
+                    self.server_cert_pem = existing_pem
+                    self.server_cert_chain_pems = self.pki.get_cert_chain_pems(server_cert)
+                    print("[SERVER] Đã tải Server Certificate hiện có (còn hạn).")
+                else:
+                    print("[SERVER] Server Certificate đã hết hạn, sẽ cấp lại.")
+            except Exception as e:
+                print(f"[SERVER] Cert hiện có không hợp lệ ({e}), sẽ cấp lại.")
+
         if server_cert is None:
-            raise RuntimeError("Không thể cấp Server Certificate từ PKI")
-
-        self.server_cert_pem = serialize_cert_to_pem(server_cert)
-        self.server_cert_chain_pems = self.pki.get_cert_chain_pems(server_cert)
-
-        with open(server_cert_path, "w", encoding="utf-8") as f:
-            f.write(self.server_cert_pem)
-        print("[SERVER] Đã cấp Server Certificate mới qua CSR (IAM-Server).")
+            server_csr = create_csr("IAM-Server", "IAM Security System", self.server_private_key)
+            server_cert = self.pki.issue_cert_from_csr(server_csr, is_server=True)
+            if server_cert is None:
+                raise RuntimeError("Không thể cấp Server Certificate từ PKI")
+            self.server_cert_pem = serialize_cert_to_pem(server_cert)
+            self.server_cert_chain_pems = self.pki.get_cert_chain_pems(server_cert)
+            with open(server_cert_path, "w", encoding="utf-8") as f:
+                f.write(self.server_cert_pem)
+            print("[SERVER] Đã cấp Server Certificate mới qua CSR (IAM-Server).")
         # --- END MUTUAL AUTH ---
         
         self.channel = SecureTransmissionChannel()
@@ -126,10 +163,12 @@ class IAMBackendServer:
         # Cho E2E Chat
         self.active_users: Dict[str, ClientConnection] = {} # user_id -> ClientConnection
 
-        # Initialize KDC when key_store available
         try:
             if hasattr(self, 'key_store') and self.key_store is not None:
-                self.kdc = KDC(self.key_store)
+                self.kdc = KDC(
+                    self.key_store,
+                    ticket_storage=self._kdc_ticket_storage,
+                )
             else:
                 self.kdc = None
         except Exception:

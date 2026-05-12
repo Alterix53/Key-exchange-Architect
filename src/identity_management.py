@@ -13,7 +13,7 @@ import secrets
 import base64
 
 if TYPE_CHECKING:
-    from .storage_backend import UserStorage
+    from .storage_backend import UserStorage, SessionStorage
 
 
 class Role(Enum):
@@ -143,6 +143,7 @@ class User:
         self.last_login: Optional[datetime] = None
         self.is_active = True
         self.mfa_enabled = False
+        self.mfa_secret: Optional[str] = None
         self.groups: List[str] = []
         self.attributes: Dict[str, str] = {}
     
@@ -156,7 +157,9 @@ class User:
             'created_at': self.created_at.isoformat(),
             'last_login': self.last_login.isoformat() if self.last_login else None,
             'is_active': self.is_active,
+            'status': 'active' if self.is_active else 'inactive',
             'mfa_enabled': self.mfa_enabled,
+            'mfa_secret': self.mfa_secret,
             'groups': self.groups,
             'attributes': self.attributes
         }
@@ -193,7 +196,9 @@ class Session:
 
 class IdentityManagementSystem:
     """Hệ thống quản lý danh tính"""
-    def __init__(self, storage_path: str = "iam_storage", storage: Optional['UserStorage'] = None):
+    def __init__(self, storage_path: str = "iam_storage",
+                 storage: Optional['UserStorage'] = None,
+                 session_storage: Optional['SessionStorage'] = None):
         self.storage_path = storage_path
         
         if storage is not None:
@@ -204,6 +209,14 @@ class IdentityManagementSystem:
 
             conn_str = get_working_connection_string()
             self.storage = SqlServerUserStorage(conn_str)
+
+        if session_storage is not None:
+            self.session_storage = session_storage
+        else:
+            from .db import get_working_connection_string
+            from .storage_backend import SqlServerSessionStorage
+            conn_str = get_working_connection_string()
+            self.session_storage = SqlServerSessionStorage(conn_str)
         
         self.users: Dict[str, User] = {}
         self.sessions: Dict[str, Session] = {}
@@ -211,6 +224,7 @@ class IdentityManagementSystem:
         self.mfa = MFAProvider()
         
         self._load_users()
+        self._load_sessions()
     
     def hash_password(self, password: str, salt: Optional[str] = None) -> str:
         """Băm mật khẩu với salt"""
@@ -281,6 +295,7 @@ class IdentityManagementSystem:
         
         self.sessions[session_id] = session
         user.last_login = datetime.now()
+        self._persist_session(session)
         
         return session
     
@@ -328,6 +343,7 @@ class IdentityManagementSystem:
         
         mfa_secret = self.mfa.generate_mfa_secret(user_id)
         user.mfa_enabled = True
+        user.mfa_secret = mfa_secret
         self._save_user(user)
         
         return mfa_secret
@@ -340,6 +356,7 @@ class IdentityManagementSystem:
         """Đăng xuất"""
         if session_id in self.sessions:
             self.sessions[session_id].is_active = False
+            self.session_storage.deactivate_session(session_id)
     
     def _save_user(self, user: User):
         """Lưu người dùng qua storage backend"""
@@ -355,11 +372,56 @@ class IdentityManagementSystem:
                 data.get('password_hash', ''),
                 [Role(r) for r in data.get('roles', ['user'])]
             )
-            user.is_active = data.get('is_active', True)
+            status = data.get('status', 'active')
+            user.is_active = (status == 'active') if status else data.get('is_active', True)
             user.mfa_enabled = data.get('mfa_enabled', False)
+            user.mfa_secret = data.get('mfa_secret')
             user.groups = data.get('groups', [])
             user.attributes = data.get('attributes', {})
+
+            if user.mfa_secret and user.mfa_enabled:
+                self.mfa.mfa_secrets[user.user_id] = user.mfa_secret
+                self.mfa.mfa_attempts[user.user_id] = 0
+
+            if data.get('created_at'):
+                try:
+                    user.created_at = datetime.fromisoformat(data['created_at'])
+                except (ValueError, TypeError):
+                    pass
+            if data.get('last_login'):
+                try:
+                    user.last_login = datetime.fromisoformat(data['last_login'])
+                except (ValueError, TypeError):
+                    pass
+
             self.users[user.user_id] = user
+
+    def _persist_session(self, session: Session):
+        """Lưu session vào persistence layer."""
+        self.session_storage.save_session(session.to_dict())
+
+    def _load_sessions(self):
+        """Khôi phục các session active từ DB."""
+        for data in self.session_storage.load_active_sessions():
+            session = Session(data['session_id'], data['user_id'])
+            if data.get('created_at'):
+                try:
+                    session.created_at = datetime.fromisoformat(data['created_at'])
+                except (ValueError, TypeError):
+                    pass
+            if data.get('expires_at'):
+                try:
+                    session.expires_at = datetime.fromisoformat(data['expires_at'])
+                except (ValueError, TypeError):
+                    pass
+            session.is_active = data.get('is_active', True)
+            session.ip_address = data.get('ip_address')
+            session.user_agent = data.get('user_agent')
+            session.mfa_verified = data.get('mfa_verified', False)
+            if session.is_expired():
+                self.session_storage.deactivate_session(session.session_id)
+                continue
+            self.sessions[session.session_id] = session
     
     def list_users(self) -> List[Dict]:
         """Liệt kê người dùng"""
