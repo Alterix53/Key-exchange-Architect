@@ -415,6 +415,58 @@ class IAMBackendServer:
             },
         })
 
+    def handle_revoke_cert(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
+        """Xin thu hồi certificate của chính user (khi bị lộ)."""
+        # Kiểm tra user có certificate không
+        cert = self.pki.lookup(user_id)
+        if cert is None:
+            conn.send({"type": "error", "message": f"Không tìm thấy certificate để thu hồi"})
+            return
+
+        try:
+            # Gọi PKI để thu hồi
+            success = self.pki.revoke(user_id)
+            if not success:
+                conn.send({"type": "error", "message": "PKI không thể thu hồi certificate"})
+                self.audit_logger.log_event(
+                    AuditEventType.CERT_REVOKED,
+                    user_id,
+                    "pki",
+                    "revoke_cert",
+                    "failed",
+                    details={"reason": "PKI revoke failed"}
+                )
+                return
+
+            # Thu hồi thành công - lấy CRL mới cập nhật
+            crls = self.pki.get_all_crls_pem()
+            
+            self.audit_logger.log_event(
+                AuditEventType.CERT_REVOKED,
+                user_id,
+                "pki",
+                "revoke_cert",
+                "success",
+                details={"serial_number": format(cert.serial_number, "x"), "reason": "User requested revocation"}
+            )
+
+            conn.send({
+                "type": "revoke_cert_ok",
+                "message": f"Certificate của {user_id} đã được thu hồi thành công",
+                "crls": crls,
+            })
+        except Exception as e:
+            self.audit_logger.log_event(
+                AuditEventType.SYSTEM_ERROR,
+                user_id,
+                "pki",
+                "revoke_cert",
+                "failed",
+                details={"error": str(e)}
+            )
+            conn.send({"type": "error", "message": f"Lỗi thu hồi certificate: {str(e)}"})
+
+
     def handle_directory(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
         """Lấy danh sách Users & active status"""
         if not self._check_permission(user_id, "users", "read"):
@@ -860,6 +912,8 @@ class IAMBackendServer:
                     
                 if req_type == "cert_req":
                     self.handle_cert_request(req, conn, user_id)
+                elif req_type == "revoke_cert":
+                    self.handle_revoke_cert(req, conn, user_id)
                 elif req_type == "hello":
                     self.handle_hello(req, conn, user_id)
                 elif req_type == "directory":

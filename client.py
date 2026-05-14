@@ -725,12 +725,49 @@ class IAMDemoClient:
             else:
                 print_error(f"Chứng chỉ hiện tại không hợp lệ: {msg}")
 
-            print(json.dumps({
+            cert_info = {
                 "subject": res.get("subject"),
                 "serial_number": res.get("serial_number"),
                 "cert_chain_len": len(cert_chain),
                 "crl_count": len(crls),
-            }, indent=2, ensure_ascii=False))
+            }
+            
+            # Interactive menu
+            while True:
+                print("\n" + "─" * 50)
+                print("📋 Lựa chọn thao tác với chứng chỉ:")
+                print("  1. Xem chi tiết chứng chỉ")
+                print("  2. Xin thu hồi chứng chỉ (nếu bị lộ)")
+                print("  3. Quay lại menu chính")
+                print("─" * 50)
+                
+                choice = input("Nhập lựa chọn (1-3): ").strip()
+                
+                if choice == "1":
+                    print("\n" + json.dumps(cert_info, indent=2, ensure_ascii=False))
+                    
+                elif choice == "2":
+                    print_header("Thu hồi Chứng chỉ")
+                    confirm = input("⚠️  Bạn có chắc muốn thu hồi chứng chỉ? (yes/no): ").strip().lower()
+                    if confirm == "yes":
+                        revoke_res = self._sync_request({
+                            "type": "revoke_cert"
+                        }, "revoke_cert_ok")
+                        if revoke_res:
+                            print_success(revoke_res.get("message", "Chứng chỉ đã được thu hồi thành công"))
+                            crls_updated = revoke_res.get("crls", [])
+                            print(f"ℹ️  CRL đã được cập nhật ({len(crls_updated)} entries)")
+                            break
+                    else:
+                        print_error("Đã hủy yêu cầu thu hồi")
+                    
+                elif choice == "3":
+                    print("Quay lại menu chính...")
+                    break
+                    
+                else:
+                    print_error("Lựa chọn không hợp lệ")
+
 
     def do_audit_logs(self):
         print_header("Audit Logs")

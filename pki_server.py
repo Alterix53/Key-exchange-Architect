@@ -218,6 +218,63 @@ class PKIServer:
                     print(f"[PKI Server] ⚠ Lỗi ghi audit log: {log_err}")
             return {"status": "error", "message": str(e)}
 
+    def _handle_revoke_cert(self, data: dict) -> dict:
+        """Action: revoke_cert — Thu hồi certificate theo subject CN."""
+        subject_cn = data.get("subject_cn")
+        if not subject_cn:
+            return {"status": "error", "message": "Thiếu subject_cn"}
+
+        try:
+            success = self.pki.revoke(subject_cn)
+            if not success:
+                print(f"[PKI Server] ℹ revoke('{subject_cn}') → không tìm thấy certificate")
+                if self.audit_logger:
+                    try:
+                        self.audit_logger.log_event(
+                            AuditEventType.CERT_REVOKED,
+                            subject_cn,
+                            "pki",
+                            "revoke_cert",
+                            "failed",
+                            details={"reason": "Certificate not found"}
+                        )
+                    except Exception as e:
+                        print(f"[PKI Server] ⚠ Lỗi ghi audit log: {e}")
+                return {"status": "error", "message": f"Certificate cho '{subject_cn}' không tồn tại"}
+
+            print(f"[PKI Server] ✓ revoke('{subject_cn}') → thành công")
+            crls = self.pki.get_all_crls_pem()
+            
+            if self.audit_logger:
+                try:
+                    self.audit_logger.log_event(
+                        AuditEventType.CERT_REVOKED,
+                        subject_cn,
+                        "pki",
+                        "revoke_cert",
+                        "success",
+                        details={"subject_cn": subject_cn, "crl_count": len(crls)}
+                    )
+                except Exception as e:
+                    print(f"[PKI Server] ⚠ Lỗi ghi audit log: {e}")
+            
+            return {"status": "ok", "result": {"message": f"Certificate '{subject_cn}' đã được thu hồi", "crls": crls}}
+        except Exception as e:
+            print(f"[PKI Server] ✗ Lỗi revoke_cert: {e}")
+            if self.audit_logger:
+                try:
+                    self.audit_logger.log_event(
+                        AuditEventType.SYSTEM_ERROR,
+                        subject_cn or "unknown",
+                        "pki",
+                        "revoke_cert",
+                        "failed",
+                        details={"error": str(e)}
+                    )
+                except Exception as log_err:
+                    print(f"[PKI Server] ⚠ Lỗi ghi audit log: {log_err}")
+            return {"status": "error", "message": str(e)}
+
     # ------------------------------------------------------------------
     #   Router — Phân phối action
     # ------------------------------------------------------------------
@@ -227,6 +284,7 @@ class PKIServer:
         "lookup": "_handle_lookup",
         "get_chain": "_handle_get_chain",
         "get_crls": "_handle_get_crls",
+        "revoke_cert": "_handle_revoke_cert",
     }
 
     def _dispatch(self, payload: dict) -> dict:
