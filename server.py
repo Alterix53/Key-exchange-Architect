@@ -272,6 +272,20 @@ class IAMBackendServer:
                 self.active_users[session.user_id] = conn
 
             self._notify_peer_joined(session.user_id)
+            
+            # Initialize entity master key for KDC if not exists
+            if self.kdc:
+                try:
+                    # Check if entity master key exists by trying to get it
+                    existing_key = self.key_store.get_entity_master_key(session.user_id)
+                    if existing_key is None:
+                        # Create entity master key on first login
+                        self.kdc.create_entity_master_key(session.user_id)
+                        self.audit_logger.log_event(AuditEventType.KEY_GENERATED, session.user_id, "kdc", "entity_master_key", "success")
+                except Exception as e:
+                    # Log but don't fail login if key creation fails
+                    print(f"[KDC] Warning: Could not initialize entity master key for {session.user_id}: {e}")
+                    self.audit_logger.log_event(AuditEventType.KEY_GENERATED, session.user_id, "kdc", "entity_master_key", "failed", details={"error": str(e)})
 
             server_auth_proof = self.channel.sign_message(
                 f"{session.session_id}|{client_nonce}|login_ok",
@@ -496,6 +510,59 @@ class IAMBackendServer:
         except Exception as e:
             conn.send({"type": "error", "message": str(e)})
 
+    def handle_kdc_keyreq(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
+        """Handle KDC key request from client
+        
+        Client sends KEYREQ plaintext (connection is TLS/X.509 authenticated).
+        Server validates peer, issues session ticket, and returns plaintext response.
+        """
+        if not self.kdc:
+            conn.send({"type": "error", "message": "KDC not initialized on server"})
+            return
+        
+        peer_id = req.get("peer_id")
+        requested_ttl = req.get("requested_ttl", 300)
+        
+        if not peer_id:
+            conn.send({"type": "error", "message": "Missing peer_id"})
+            return
+        
+        try:
+            # Validate peer exists
+            if peer_id not in self.iam.users:
+                conn.send({"type": "error", "message": f"Peer '{peer_id}' not found"})
+                self.audit_logger.log_event(AuditEventType.FAILED_LOGIN, user_id, "kdc", "keyreq", "failed", 
+                                          details={"reason": "peer_not_found", "peer": peer_id})
+                return
+            
+            # Issue session ticket + key
+            # Returns: {"ks": plaintext_b64, "ticket": encrypted, "ticket_nonce": nonce, "ticket_id": id, "ttl": ttl, ...}
+            response = self.kdc.issue_session_ticket(user_id, peer_id, requested_ttl)
+            if not response:
+                conn.send({"type": "error", "message": "Failed to issue session ticket"})
+                self.audit_logger.log_event(AuditEventType.FAILED_LOGIN, user_id, "kdc", "keyreq", "failed", 
+                                          details={"reason": "ticket_issue_failed"})
+                return
+            
+            # Send plaintext response (connection is authenticated via X.509)
+            conn.send({
+                "type": "kdc_keyresp",
+                "session_key": response.get("ks"),           # Plaintext session key
+                "ticket": response.get("ticket"),             # Encrypted ticket (for Bob)
+                "ticket_nonce": response.get("ticket_nonce"),
+                "ticket_id": response.get("ticket_id"),
+                "ttl": response.get("ttl"),
+                "issued_at": response.get("issued_at")
+            })
+            
+            self.audit_logger.log_event(AuditEventType.MESSAGE_RECEIVED, user_id, "kdc", "keyreq", "success", 
+                                      details={"peer": peer_id, "ttl": requested_ttl, "ticket_id": response.get("ticket_id")})
+            
+        except Exception as e:
+            conn.send({"type": "error", "message": f"KDC error: {str(e)}"})
+            self.audit_logger.log_event(AuditEventType.FAILED_LOGIN, user_id, "kdc", "keyreq", "failed", 
+                                      details={"reason": "exception", "error": str(e)})
+
     def process_kdc_keyreq(self, requester_id: str, enc_b64: str, nonce_b64: str) -> Dict[str, Any]:
         """Process a KDC KEYREQ from requester_id. Returns envelope dict or error."""
         if not self.kdc:
@@ -634,6 +701,30 @@ class IAMBackendServer:
                 "ciphertext": req.get("ciphertext"),
                 "tag": req.get("tag"),
             })
+        
+        # E2E - Chat Invite via KDC (Initiator → Responder with KDC ticket)
+        elif relay_type == "chat_invite_kdc":
+            # Validate ticket before forwarding
+            ticket_id = req.get("ticket_id")
+            if ticket_id and self.kdc:
+                if not self.kdc.validate_ticket(ticket_id):
+                    conn.send({"type": "error", "message": "KDC ticket invalid or expired"})
+                    self.audit_logger.log_event(AuditEventType.FAILED_LOGIN, user_id, "kdc", "ticket_relay", "failed", 
+                                              details={"reason": "invalid_ticket", "ticket_id": ticket_id})
+                    return
+                
+                # Mark ticket as used (prevent replay)
+                self.kdc.mark_ticket_used(ticket_id)
+            
+            target_conn.send({
+                "type": "peer_chat_invite_kdc",
+                "sender_id": user_id,
+                "ticket": req.get("ticket"),
+                "ticket_nonce": req.get("ticket_nonce"),
+                "ticket_id": req.get("ticket_id"),
+            })
+            self.audit_logger.log_event(AuditEventType.MESSAGE_RECEIVED, user_id, "kdc", "ticket_relay", "success", 
+                                      details={"to": resolved_target_id, "ticket_id": ticket_id})
 
         # E2E - Chat Accept (Responder → Initiator)
         elif relay_type == "chat_accept":
@@ -648,6 +739,47 @@ class IAMBackendServer:
                 "crls": self.pki.get_all_crls_pem(),
                 "signature": req.get("signature"),
             })
+        
+        # E2E - Chat Accept KDC Mode (Responder accepts, gets session key)
+        elif relay_type == "chat_accept_kdc":
+            # Bob is accepting the KDC chat invite
+            # Decrypt ticket + send session key to Bob
+            ticket_id = req.get("ticket_id")
+            
+            if not ticket_id or not self.kdc:
+                conn.send({"type": "error", "message": "Invalid KDC accept request"})
+                return
+            
+            # Get ticket record
+            ticket_rec = self.kdc.get_ticket_record(ticket_id)
+            if not ticket_rec:
+                conn.send({"type": "error", "message": "Ticket not found"})
+                return
+            
+            # Extract session key from ticket
+            ks_b64 = ticket_rec.get("ks")
+            ida = ticket_rec.get("ida")
+            
+            if not ks_b64:
+                conn.send({"type": "error", "message": "Cannot extract session key from ticket"})
+                return
+            
+            # Send plaintext session key to Bob
+            conn.send({
+                "type": "kdc_session_key",
+                "session_key": ks_b64,
+                "sender_id": ida,
+                "ticket_id": ticket_id
+            })
+            
+            # Notify Alice that Bob accepted
+            target_conn.send({
+                "type": "peer_chat_accept_kdc",
+                "sender_id": user_id,
+            })
+            
+            self.audit_logger.log_event(AuditEventType.MESSAGE_RECEIVED, user_id, "kdc", "chat_accept", "success",
+                                      details={"peer": ida, "ticket_id": ticket_id})
 
         # E2E - Chat Decline (Responder → Initiator)
         elif relay_type == "chat_decline":
@@ -740,6 +872,8 @@ class IAMBackendServer:
                     self.handle_key_list(req, conn, user_id)
                 elif req_type == "key_gen":
                     self.handle_key_gen(req, conn, user_id)
+                elif req_type == "kdc_keyreq":
+                    self.handle_kdc_keyreq(req, conn, user_id)
                 elif req_type == "relay":
                     self.handle_relay(req, conn, user_id)
                 else:

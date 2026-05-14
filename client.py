@@ -327,11 +327,53 @@ class IAMDemoClient:
                         continue
                     self.pending_chat_invite = data
                     sender = data.get("sender_id", "?")
-                    print(f"\n{Colors.OKCYAN}[INVITE] {sender} mời bạn chat E2E. Chọn '5. Chế độ chat' ở menu để phản hồi.{Colors.ENDC}")
+                    print(f"\n{Colors.OKCYAN}[INVITE] {sender} mời bạn chat E2E (Peer-to-peer). Chọn '5. Chế độ chat' ở menu để phản hồi.{Colors.ENDC}")
+                    continue
+                
+                if req_type == "peer_chat_invite_kdc":
+                    if self.in_chat_mode:
+                        # Đang bận chat — tự động từ chối
+                        self._send_req({
+                            "type": "relay",
+                            "relay_type": "chat_decline",
+                            "target_id": data.get("sender_id", ""),
+                        })
+                        continue
+                    
+                    # Handle KDC invite - decrypt ticket and extract session key
+                    ticket_enc = data.get("ticket")
+                    ticket_nonce = data.get("ticket_nonce")
+                    ticket_id = data.get("ticket_id")
+                    sender_id = data.get("sender_id", "?")
+                    
+                    if all([ticket_enc, ticket_nonce, ticket_id]):
+                        # Try to decrypt ticket (server-side encryption, so we can't decrypt here)
+                        # Instead, we'll accept and extract the key from response later
+                        self.pending_ticket = ticket_enc
+                        self.pending_ticket_nonce = ticket_nonce
+                        self.pending_ticket_id = ticket_id
+                        self.chat_peer_id = sender_id
+                        print(f"\n{Colors.OKCYAN}[INVITE-KDC] {sender_id} mời bạn chat E2E (via KDC). Chọn '5b. Chế độ chat KDC' ở menu để phản hồi.{Colors.ENDC}")
+                    else:
+                        print(f"\n{Colors.FAIL}[ERROR] KDC invite không hợp lệ từ {sender_id}{Colors.ENDC}")
                     continue
 
                 if req_type == "peer_chat_accept" and not self.in_chat_mode:
                     self._handle_chat_accept(data)
+                    continue
+
+                if req_type == "peer_chat_accept_kdc" and not self.in_chat_mode:
+                    # Alice receives confirmation that Bob accepted KDC chat
+                    sender = data.get("sender_id", "?")
+                    self._chat_accepted = True
+                    self._chat_ready_event.set()
+                    continue
+
+                if req_type == "kdc_session_key" and not self.in_chat_mode:
+                    # Bob receives session key from server after accepting
+                    with self._response_cv:
+                        self.pending_responses["kdc_session_key"] = data
+                        self._response_cv.notify_all()
                     continue
 
                 if req_type == "peer_chat_decline" and not self.in_chat_mode:
@@ -555,7 +597,8 @@ class IAMDemoClient:
             print("  2. Xem chứng chỉ (Certificate)")
             print("  3. Xem audit log")
             print("  4. Xem danh sách users")
-            print("  5. Chế độ chat mã hóa E2E")
+            print("  5. Chế độ chat mã hóa E2E (Peer-to-peer)")
+            print("  5b. Chế độ chat mã hóa E2E (via KDC)")
             print("  0. Đăng xuất")
             print(f"{Colors.HEADER}╚══════════════════════════════════════════╝{Colors.ENDC}")
             
@@ -571,6 +614,8 @@ class IAMDemoClient:
                 self.do_list_users()
             elif choice == "5":
                 self.do_chat_e2e()
+            elif choice == "5b":
+                self.do_chat_e2e_kdc()
             elif choice == "0":
                 self.session_id = None
                 self.user_info = None
@@ -715,11 +760,116 @@ class IAMDemoClient:
                 print(f" • {u['username']} (ID: {u['user_id']}) | Trạng thái: {status} | Đã ĐK Cert: {cert_status}")
 
     def do_chat_e2e(self):
-        print_header("Chế độ Chat Mã hóa E2E")
+        print_header("Chế độ Chat Mã hóa E2E (Peer-to-peer)")
         if self.pending_chat_invite:
             self._do_chat_respond()
         else:
             self._do_chat_initiate()
+
+    def do_chat_e2e_kdc(self):
+        """E2E Chat using KDC for session key distribution"""
+        print_header("Chế độ Chat Mã hóa E2E (via KDC)")
+        
+        # Case 1: Responding to pending KDC invite
+        if self.pending_ticket and self.chat_peer_id:
+            print(f"Đang chờ trả lời lời mời từ {self.chat_peer_id}...")
+            
+            # Confirm acceptance
+            confirm = input(f"Bạn có muốn chấp nhận chat với {self.chat_peer_id}? (y/n): ").strip().lower()
+            if confirm != 'y':
+                print_error("Đã từ chối lời mời chat.")
+                self._reset_chat_state()
+                return
+            
+            # Send accept to server with ticket_id
+            ticket_id = self.pending_ticket_id
+            self._send_req({
+                "type": "relay",
+                "relay_type": "chat_accept_kdc",
+                "target_id": self.chat_peer_id,
+                "ticket_id": ticket_id
+            })
+            
+            print_success("Đã gửi xác nhận. Đang chờ session key...")
+            
+            # Wait for session key response
+            res = self._sync_request({}, wait_for_type="kdc_session_key", timeout=10)
+            if not res or res.get('error'):
+                print_error(f"Không nhận được session key: {res.get('error') if res else 'timeout'}")
+                self._reset_chat_state()
+                return
+            
+            # Extract session key
+            session_key_b64 = res.get("session_key")
+            if not session_key_b64:
+                print_error("Session key không hợp lệ")
+                self._reset_chat_state()
+                return
+            
+            self.chat_session_key = base64.b64decode(session_key_b64)
+            print_success("✅ Nhận session key từ KDC. Sẵn sàng chat.")
+            
+            # Enter chat mode
+            self.in_chat_mode = True
+            print(f"\n{Colors.WARNING}--- Chat với {self.chat_peer_id} via KDC (gõ 'back' để thoát) ---{Colors.ENDC}")
+            self._run_chat_loop()
+            return
+        
+        # Case 2: Initiating new KDC chat (like before)
+        print("Chế độ này sử dụng KDC để cấp phát session key với TTL tự động")
+        
+        # Show user directory
+        self.do_chat_directory()
+        
+        target_uid = input("\nNhập Username hoặc User ID muốn chat: ").strip()
+        if not target_uid:
+            return
+        
+        ttl = input("Thời gian sử dụng session key (TTL) tính bằng giây (Enter = 300): ").strip()
+        try:
+            ttl = int(ttl) if ttl else 300
+        except ValueError:
+            ttl = 300
+        
+        # Step 1: Request session key from KDC
+        print(f"\n[1] Đang yêu cầu session key từ KDC cho {target_uid}...")
+        success = self.request_session_key_via_kdc(target_uid, ttl=ttl)
+        if not success:
+            print_error("KDC session key request failed")
+            return
+        
+        # Step 2: Send chat invite with KDC ticket
+        print(f"[2] Đang gửi lời mời chat với KDC ticket tới {target_uid}...")
+        self._send_req({
+            "type": "relay",
+            "relay_type": "chat_invite_kdc",
+            "target_id": target_uid,
+            "ticket": self.pending_ticket,
+            "ticket_nonce": self.pending_ticket_nonce,
+            "ticket_id": self.pending_ticket_id,
+        })
+        
+        print_success(f"Đã gửi lời mời chat KDC tới {target_uid}. Đang chờ phản hồi (tối đa 60s)...")
+        
+        # Step 3: Wait for acceptance
+        self._chat_ready_event.clear()
+        self._chat_accepted = False
+        responded = self._chat_ready_event.wait(timeout=60)
+        
+        if not responded:
+            print_error("Hết thời gian chờ. Lời mời không được phản hồi.")
+            self._reset_chat_state()
+            return
+        
+        if not self._chat_accepted:
+            print_error(f"{target_uid} đã từ chối hoặc xác thực thất bại.")
+            self._reset_chat_state()
+            return
+        
+        # Step 4: Enter chat mode with KDC session key
+        self.in_chat_mode = True
+        print(f"\n{Colors.WARNING}--- Chat với {target_uid} via KDC (gõ 'back' để thoát) ---{Colors.ENDC}")
+        self._run_chat_loop()
 
     # ── Initiator flow ──────────────────────────────────────────────
 
@@ -963,72 +1113,65 @@ class IAMDemoClient:
         self.chat_peer_public_key = None
 
     def request_session_key_via_kdc(self, peer_id: str, ttl: int = 300) -> bool:
-        """Request a session key for peer_id from KDC via server."""
+        """Request a session key from KDC for communication with peer_id.
+        
+        Flow:
+        1. Client sends plaintext kdc_keyreq to server (connection is X.509 authenticated)
+        2. Server validates peer, issues session ticket
+        3. Receive kdc_keyresp with plaintext session_key + encrypted ticket
+        4. Extract session key
+        5. Store session key + ticket for chat
+        6. Return True if success
+        """
         try:
-            # Build KEYREQ payload
-            nonce = secrets.token_urlsafe(16)
-            payload = {
-                "type": "KEYREQ",
-                "ida": self.user_info.get('user_id') if self.user_info else "unknown",
-                "idb": peer_id,
-                "requested_ttl": ttl,
-                "nonce_a": nonce,
-                "ts": datetime.utcnow().isoformat() + "Z"
-            }
-
-            # Get own entity master key (raw bytes) from KeyStore
-            # Note: KeyStore instance must be available server-side; for client demo we assume client has a copy
-            ka = None
-            try:
-                ka = self.channel_key  # placeholder: clients should load their entity master key securely
-            except Exception:
-                ka = None
-
-            if not ka:
-                print("[KDC] Missing local entity master key (ka).")
+            if not self.session_id:
+                print_error("Not authenticated")
                 return False
-
-            envelope = encrypt_json_with_key(ka, payload)
-
-            # Send to server as kdc_keyreq
+            
+            my_id = self.user_info.get('user_id') if self.user_info else None
+            if not my_id:
+                print_error("User ID not found")
+                return False
+            
+            # Send plaintext KDC request to server
             req = {
                 "type": "kdc_keyreq",
-                "enc": envelope.get('enc'),
-                "nonce": envelope.get('nonce')
+                "peer_id": peer_id,
+                "requested_ttl": ttl
             }
             self._send_req(req)
-
+            
             # Wait for response (kdc_keyresp) via sync
-            res = self._sync_request({}, wait_for_type="kdc_keyresp", timeout=5)
+            res = self._sync_request({}, wait_for_type="kdc_keyresp", timeout=10)
             if not res or res.get('error'):
-                print_error("KDC response failed")
+                print_error(f"KDC response failed: {res.get('error') if res else 'timeout'}")
                 return False
-
-            # Decrypt response with Ka
-            enc = res.get('enc')
-            nonce_b64 = res.get('nonce')
-            resp = decrypt_json_with_key(ka, enc, nonce_b64)
-
-            ks_b64 = resp.get('ks')
-            ticket_enc = resp.get('ticket')
-            ticket_nonce = resp.get('ticket_nonce')
-            ticket_id = resp.get('ticket_id')
-
-            # Save Ks locally for session (decoded)
-            self.chat_session_key = base64.b64decode(ks_b64)
-
-            # Forward ticket to peer via server
-            forward_req = {
-                "type": "forward_ticket",
-                "to": peer_id,
-                "ticket": ticket_enc,
-                "ticket_nonce": ticket_nonce,
-                "ticket_id": ticket_id
-            }
-            self._send_req(forward_req)
+            
+            # Extract response (plaintext session_key + encrypted ticket)
+            session_key_b64 = res.get('session_key')
+            ticket_enc = res.get('ticket')
+            ticket_nonce = res.get('ticket_nonce')
+            ticket_id = res.get('ticket_id')
+            ttl_resp = res.get('ttl')
+            
+            if not all([session_key_b64, ticket_enc, ticket_nonce, ticket_id]):
+                print_error("Incomplete KDC response")
+                return False
+            
+            # Decode session key (plaintext from server)
+            self.chat_session_key = base64.b64decode(session_key_b64)
+            self.pending_ticket = ticket_enc
+            self.pending_ticket_nonce = ticket_nonce
+            self.pending_ticket_id = ticket_id
+            self.chat_peer_id = peer_id
+            
+            print_success(f"✅ Nhận session key từ KDC (TTL: {ttl_resp}s)")
             return True
+            
         except Exception as e:
             print_error(f"KDC request error: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def handle_forwarded_ticket(self, data: Dict):

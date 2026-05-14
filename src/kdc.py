@@ -54,6 +54,89 @@ class KDC:
         if self.storage is not None:
             self.storage.save_ticket({"ticket_id": ticket_id, **rec})
 
+    # ---- Entity Master Key Management ----
+
+    def create_entity_master_key(self, entity_id: str, ttl_days: int = 365) -> Optional[str]:
+        """Create master key for entity (Alice, Bob, etc.)
+        
+        Args:
+            entity_id: User/entity identifier
+            ttl_days: Key time-to-live in days (default: 365)
+            
+        Returns:
+            key_id if successful, None if failed
+        """
+        try:
+            key_id = self.key_store.generate_entity_master_key(entity_id, ttl_days=ttl_days)
+            return key_id
+        except Exception as e:
+            print(f"[KDC] Error creating master key for {entity_id}: {e}")
+            return None
+
+    def get_entity_master_key(self, entity_id: str) -> Optional[bytes]:
+        """Get entity's master key for encryption/decryption
+        
+        Args:
+            entity_id: User/entity identifier
+            
+        Returns:
+            Decrypted key bytes if found, None otherwise
+        """
+        try:
+            key_bytes = self.key_store.get_entity_master_key(entity_id)
+            return key_bytes
+        except Exception as e:
+            print(f"[KDC] Error getting master key for {entity_id}: {e}")
+            return None
+
+    def rotate_entity_key(self, entity_id: str) -> Optional[str]:
+        """Rotate entity master key (create new version)
+        
+        Args:
+            entity_id: User/entity identifier
+            
+        Returns:
+            new_key_id if successful, None if failed
+        """
+        try:
+            new_key_id = self.key_store.rotate_entity_master_key(entity_id)
+            return new_key_id
+        except Exception as e:
+            print(f"[KDC] Error rotating master key for {entity_id}: {e}")
+            return None
+
+    def revoke_entity_key(self, entity_id: str) -> bool:
+        """Revoke entity master key (mark inactive)
+        
+        Args:
+            entity_id: User/entity identifier
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            self.key_store.revoke_entity_master_key(entity_id)
+            return True
+        except Exception as e:
+            print(f"[KDC] Error revoking master key for {entity_id}: {e}")
+            return False
+
+    def list_entity_keys(self, entity_id: str) -> Optional[list]:
+        """List all keys for an entity
+        
+        Args:
+            entity_id: User/entity identifier
+            
+        Returns:
+            List of key metadata, None if failed
+        """
+        try:
+            keys = self.key_store.list_keys(owner=entity_id)
+            return keys
+        except Exception as e:
+            print(f"[KDC] Error listing keys for {entity_id}: {e}")
+            return None
+
     # ---- public API ----
 
     def issue_session_ticket(self, ida: str, idb: str, requested_ttl: int = 300) -> Optional[Dict[str, str]]:
