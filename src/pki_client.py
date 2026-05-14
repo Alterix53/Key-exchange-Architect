@@ -31,15 +31,15 @@ class PKIClient:
     def __init__(self, host: str = "127.0.0.1", port: int = 5005):
         self.host = host
         self.port = port
-        print(f"[PKI Client] Khởi tạo — target PKI Server: {host}:{port}")
+        print(f"[PKI Client] Initializing - target PKI Server: {host}:{port}")
 
         # Thử kết nối lần đầu để kiểm tra PKI Server có chạy không
         try:
             self._call("get_crls", {})
-            print(f"[PKI Client] ✓ Đã kết nối thành công tới PKI Server ({host}:{port})")
+            print(f"[PKI Client] OK - Successfully connected to PKI Server ({host}:{port})")
         except Exception as e:
-            print(f"[PKI Client] ⚠ Không thể kết nối PKI Server lúc khởi tạo: {e}")
-            print(f"[PKI Client] ⚠ Các thao tác PKI sẽ thất bại cho đến khi PKI Server được bật.")
+            print(f"[PKI Client] WARN - Failed to connect to PKI Server at init: {e}")
+            print(f"[PKI Client] WARN - PKI operations will fail until PKI Server is started.")
 
     # ------------------------------------------------------------------
     #   Giao tiếp Socket cơ bản
@@ -62,8 +62,8 @@ class PKIClient:
             sock.connect((self.host, self.port))
         except (ConnectionRefusedError, socket.timeout, OSError) as e:
             raise Exception(
-                f"Không thể kết nối PKI Server ({self.host}:{self.port}) — Timeout {PKI_CONNECT_TIMEOUT}s. "
-                f"Hãy đảm bảo pki_server.py đang chạy. Lỗi gốc: {e}"
+                f"Cannot connect to PKI Server ({self.host}:{self.port}) - Timeout {PKI_CONNECT_TIMEOUT}s. "
+                f"Make sure pki_server.py is running. Error: {e}"
             )
 
         try:
@@ -73,12 +73,12 @@ class PKIClient:
             reader = sock.makefile("r", encoding="utf-8")
             raw_line = reader.readline()
             if not raw_line:
-                raise Exception("PKI Server đóng kết nối mà không trả response")
+                raise Exception("PKI Server closed connection without response")
 
             response = json.loads(raw_line.strip())
 
             if response.get("status") == "error":
-                raise Exception(f"PKI Server trả lỗi: {response.get('message', 'Unknown')}")
+                raise Exception(f"PKI Server returned error: {response.get('message', 'Unknown')}")
 
             return response
         finally:

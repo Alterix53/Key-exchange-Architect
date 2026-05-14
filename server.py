@@ -18,6 +18,9 @@ from typing import Any, Dict, Optional, List
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+#import keystore:
+from src.key_management import KeyStore
+
 # Import các components từ IAM Core Module
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.identity_management import IdentityManagementSystem, Role, Permission
@@ -68,29 +71,35 @@ class IAMBackendServer:
         
         # Khởi tạo storage và các hệ thống IAM với storage backend SQL Server
         # lưu dữ liệu trong sql
-        print("[INIT] Đang tải các phân hệ IAM (Backend: sqlserver)...")
+        print("[INIT] Loading IAM subsystems (Backend: sqlserver)...")
 
         # Khởi tạo storage backed SQL
         from src.db import get_working_connection_string
         from src.storage_backend import (
             SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage,
             SqlServerSessionStorage, SqlServerKdcTicketStorage,
+            HybridAuditStorage,
         )
         conn_str = get_working_connection_string()
 
         # khởi tạo các thành phần liên kết với SQL Server
         user_storage = SqlServerUserStorage(conn_str)
         key_storage = SqlServerKeyStorage(conn_str)
-        audit_storage = SqlServerAuditStorage(conn_str)
+        audit_storage = HybridAuditStorage(conn_str, "demo_audit")  # Hybrid: SQL + JSON
         session_storage = SqlServerSessionStorage(conn_str)
         self._kdc_ticket_storage = SqlServerKdcTicketStorage(conn_str)
 
+        self.key_store = KeyStore("demo_keys", storage=key_storage)
         self.iam = IdentityManagementSystem(
             "demo_identity", storage=user_storage, session_storage=session_storage,
             key_store=self.key_store  # Pass keystore so IAM can generate initial keys
         )
-        self.key_store = KeyStore("demo_keys", storage=key_storage)
         self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
+
+        # Initialize server keys storage (file-based, not in database)
+        self.server_keys_dir = "pki/server_keys"
+        os.makedirs(self.server_keys_dir, exist_ok=True)
+        self._load_or_create_server_keys()
 
         # liên kết với Hệ thống PKI nhằm xin chứng chỉ
         # Nếu thất bại kết nối PKI -> không có chứng chỉ
@@ -111,9 +120,9 @@ class IAMBackendServer:
                 self.server_private_key = serialization.load_pem_private_key(
                     f.read(), password=pki_passphrase,
                 )
-            print("[SERVER] Đã tải Server Private Key từ file.")
+            print("[SERVER] Loaded server private key from file.")
         else:
-            print("[SERVER] Khởi tạo Server Private Key mới...")
+            print("[SERVER] Generating new server private key...")
             self.server_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
             enc_algo = (
                 serialization.BestAvailableEncryption(pki_passphrase)
@@ -142,37 +151,24 @@ class IAMBackendServer:
                     server_cert = existing_cert
                     self.server_cert_pem = existing_pem
                     self.server_cert_chain_pems = self.pki.get_cert_chain_pems(server_cert)
-                    print("[SERVER] Đã tải Server Certificate hiện có (còn hạn).")
+                    print("[SERVER] Loaded existing server certificate (valid).")
                 else:
-                    print("[SERVER] Server Certificate đã hết hạn, sẽ cấp lại.")
+                    print("[SERVER] Server certificate expired, will re-issue.")
             except Exception as e:
-                print(f"[SERVER] Cert hiện có không hợp lệ ({e}), sẽ cấp lại.")
+                print(f"[SERVER] Existing cert invalid ({e}), will re-issue.")
 
         if server_cert is None:
             server_csr = create_csr("IAM-Server", "IAM Security System", self.server_private_key)
             server_cert = self.pki.issue_cert_from_csr(server_csr, is_server=True)
             if server_cert is None:
-                raise RuntimeError("Không thể cấp Server Certificate từ PKI")
+                raise RuntimeError("Failed to issue server certificate from PKI")
             self.server_cert_pem = serialize_cert_to_pem(server_cert)
             self.server_cert_chain_pems = self.pki.get_cert_chain_pems(server_cert)
             with open(server_cert_path, "w", encoding="utf-8") as f:
                 f.write(self.server_cert_pem)
-            print("[SERVER] Đã cấp Server Certificate mới qua CSR (IAM-Server).")
+            print("[SERVER] Issued new server certificate via CSR (IAM-Server).")
         # --- END MUTUAL AUTH ---
-        
-        # Generate initial account key for server and store to keystore
-        try:
-            server_key_id = "server_initial"
-            self.key_store.generate_symmetric_key(
-                key_id=server_key_id,
-                owner="server",
-                purpose="initial account Key",
-                algorithm="AES-256"
-            )
-            print(f"[SERVER] ✓ Generated initial key for server: {server_key_id}")
-        except Exception as e:
-            print(f"[SERVER] ⚠ Failed to generate server initial key: {e}")
-        
+
         self.channel = SecureTransmissionChannel()
         self.replay_protector = ReplayProtector(time_window_seconds=30)
         
@@ -194,6 +190,50 @@ class IAMBackendServer:
             self.kdc = None
 
     # ------------- [CORE: SESSIONS & AUTH] -------------
+
+    def _load_or_create_server_keys(self) -> None:
+        """Load or create server's symmetric key for secure communication (file-based storage)"""
+        server_key_path = os.path.join(self.server_keys_dir, "server_symmetric_key.json")
+        
+        if os.path.exists(server_key_path):
+            try:
+                with open(server_key_path, "r") as f:
+                    key_data = json.load(f)
+                self.server_key_id = key_data.get("key_id")
+                self.server_key = base64.b64decode(key_data.get("key"))
+                print(f"[INIT] Loaded server symmetric key: {self.server_key_id}")
+            except Exception as e:
+                print(f"[INIT] Warning: Failed to load server key: {e}")
+                self._generate_new_server_key(server_key_path)
+        else:
+            self._generate_new_server_key(server_key_path)
+    
+    def _generate_new_server_key(self, server_key_path: str) -> None:
+        """Generate new server symmetric key and save to file"""
+        try:
+            self.server_key_id = f"server_symmetric_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            self.server_key = os.urandom(32)  # 256-bit AES key
+            
+            key_data = {
+                "key_id": self.server_key_id,
+                "algorithm": "AES-256",
+                "key": base64.b64encode(self.server_key).decode("utf-8"),
+                "created_at": datetime.now().isoformat(),
+                "purpose": "server_symmetric_communication"
+            }
+            
+            os.makedirs(os.path.dirname(server_key_path), exist_ok=True)
+            with open(server_key_path, "w") as f:
+                json.dump(key_data, f, indent=2)
+            
+            # Set file permissions to restrict access (Unix-like systems)
+            if os.name != 'nt':
+                os.chmod(server_key_path, 0o600)
+            
+            print(f"[INIT] Generated new server symmetric key: {self.server_key_id}")
+        except Exception as e:
+            print(f"[INIT] Error: Failed to generate server key: {e}")
+            raise
 
     def _require_auth(self, req: Dict, conn: ClientConnection) -> Optional[str]:
         """Validate session, return user_id if valid, else None"""
@@ -344,7 +384,7 @@ class IAMBackendServer:
             self.audit_logger.log_event(AuditEventType.USER_CREATED, user.user_id, "backend", "register", "success", ip_address=ip)
             conn.send({"type": "register_ok", "message": "Đăng ký thành công"})
         except Exception as e:
-            conn.send({"type": "error", "message": f"Lỗi đăng ký: {str(e)}"})
+            conn.send({"type": "error", "message": f"Registration error: {str(e)}"})
 
     def handle_hello(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
         """Flow CSR: hello {csr} -> welcome {client_cert_chain, server_cert_chain}."""
@@ -415,7 +455,7 @@ class IAMBackendServer:
         """Lấy thông tin cert hiện tại của chính user."""
         cert = self.pki.lookup(user_id)
         if cert is None:
-            conn.send({"type": "error", "message": f"Không tìm thấy certificate cho {user_id}"})
+            conn.send({"type": "error", "message": f"Certificate not found for {user_id}"})
             return
 
         cert_chain = self.pki.get_cert_chain_pems(cert)
@@ -439,7 +479,7 @@ class IAMBackendServer:
         # Kiểm tra user có certificate không
         cert = self.pki.lookup(user_id)
         if cert is None:
-            conn.send({"type": "error", "message": f"Không tìm thấy certificate để thu hồi"})
+            conn.send({"type": "error", "message": "Certificate not found for revocation"})
             return
 
         try:
@@ -483,7 +523,7 @@ class IAMBackendServer:
                 "failed",
                 details={"error": str(e)}
             )
-            conn.send({"type": "error", "message": f"Lỗi thu hồi certificate: {str(e)}"})
+            conn.send({"type": "error", "message": f"Certificate revocation error: {str(e)}"})
 
 
     def handle_directory(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
@@ -976,7 +1016,7 @@ class IAMBackendServer:
         server_sock.bind((self.host, self.port))
         server_sock.listen(10)
 
-        print(f"[START] IAM API Server đang lắng nghe tại {self.host}:{self.port}")
+        print(f"[START] IAM API Server listening on {self.host}:{self.port}")
         self.audit_logger.log_event(AuditEventType.USER_LOGIN, "system", "backend", "start_server", "success")
         
         while True:

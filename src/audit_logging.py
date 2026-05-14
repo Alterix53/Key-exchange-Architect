@@ -151,6 +151,42 @@ class FileAuditStorage:
         return output_file
 
 
+class HybridAuditStorage(AuditStorage):
+    """
+    Hybrid storage - writes audit logs to BOTH SQL Server AND JSON file.
+    Ensures audit logs are stored in both locations for redundancy and file-based viewing.
+    """
+    def __init__(self, connection_string: str, log_path: str = "demo_audit"):
+        # Import here to avoid circular import at module load time
+        from .storage_backend import SqlServerAuditStorage
+        self.sql_storage = SqlServerAuditStorage(connection_string)
+        self.file_storage = FileAuditStorage(log_path)
+    
+    def save_log(self, log_dict: Dict) -> None:
+        """Save log to both SQL Server and JSON file"""
+        try:
+            self.sql_storage.save_log(log_dict)
+        except Exception as e:
+            print(f"[AUDIT] Warning: Failed to save to SQL Server: {e}")
+        
+        try:
+            self.file_storage.save_log(log_dict)
+        except Exception as e:
+            print(f"[AUDIT] Warning: Failed to save to JSON file: {e}")
+    
+    def load_all_logs(self) -> List[Dict]:
+        """Load logs from SQL Server (primary source)"""
+        try:
+            return self.sql_storage.load_all_logs()
+        except Exception as e:
+            print(f"[AUDIT] Warning: Failed to load from SQL Server, falling back to file: {e}")
+            return self.file_storage.load_all_logs()
+    
+    def export_logs(self, logs: List[Dict], fmt: str, output_file: str) -> str:
+        """Export logs using SQL Server implementation"""
+        return self.sql_storage.export_logs(logs, fmt, output_file)
+
+
 class AuditLogger:
     """Ghi lại kiểm tra"""
     def __init__(self, log_path: str = "audit_logs", storage: Optional['AuditStorage'] = None):

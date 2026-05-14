@@ -6,7 +6,7 @@ Tích hợp tất cả các component
 from .key_management import KeyStore
 from .identity_management import IdentityManagementSystem, Role, Permission
 from .secure_transmission import SecureTransmissionChannel, SecureMessage
-from .audit_logging import AuditLogger, AuditEventType
+from .audit_logging import AuditLogger, AuditEventType, HybridAuditStorage
 from .storage_backend import (
     UserStorage, KeyStorage, AuditStorage, SessionStorage, KdcTicketStorage,
     SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage,

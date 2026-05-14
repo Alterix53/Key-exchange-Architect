@@ -12,7 +12,7 @@ import sys
 import time
 import secrets
 from datetime import datetime
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -98,6 +98,15 @@ class IAMDemoClient:
         # Async responses routing
         self.pending_responses: Dict[str, Dict] = {}
         self._response_cv = threading.Condition()
+        
+        # Initialize audit logger (hybrid: file + database)
+        from src.audit_logging import AuditLogger
+        from src.storage_backend import HybridAuditStorage
+        from src.db import get_working_connection_string
+        
+        conn_str = get_working_connection_string()
+        audit_storage = HybridAuditStorage(conn_str, "demo_audit")
+        self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
 
     def _public_key_pem(self) -> str:
         return self.public_key.public_bytes(
@@ -174,7 +183,7 @@ class IAMDemoClient:
             return
 
         if deleted:
-            print(f"{Colors.OKCYAN}[KEY ROTATE] Đã xóa key cũ khỏi keystore: {', '.join(deleted)}{Colors.ENDC}")
+            print(f"{Colors.OKCYAN}[KEY ROTATE] Deleted old keys: {', '.join(deleted)}{Colors.ENDC}")
 
     def _load_or_create_identity_key(self, user_id: str, passphrase: str) -> Tuple[Any, int, bool]:
         """Load active identity key from client keystore.
@@ -260,7 +269,7 @@ class IAMDemoClient:
         self._save_identity_metadata(user_id, meta)
         self._cleanup_old_identity_keys(user_id, keep_version=new_v)
 
-        print(f"{Colors.OKCYAN}[KEY ROTATE] Đã tạo key mới HOÀN TOÀN (không dùng key cũ). old=v{old_v} → new=v{new_v}{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}[KEY ROTATE] Created new key (discarded old). v{old_v} -> v{new_v}{Colors.ENDC}")
         print(f"{Colors.OKCYAN}[KEY ROTATE] Keystore path: {key_path}{Colors.ENDC}")
 
         return priv, new_v

@@ -512,6 +512,8 @@ class SqlServerAuditStorage(AuditStorage):
         return output_file
 
 
+
+
 class SqlServerSessionStorage(SessionStorage):
     """Lưu trữ session bằng SQL Server."""
 
