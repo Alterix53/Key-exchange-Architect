@@ -97,6 +97,60 @@ class AuditLog:
         }
 
 
+class FileAuditStorage:
+    """Lưu trữ audit log dạng JSONL trong filesystem."""
+
+    def __init__(self, log_path: str):
+        self.log_path = log_path
+        os.makedirs(self.log_path, exist_ok=True)
+        self.log_file = self._resolve_log_file()
+
+    def _resolve_log_file(self) -> str:
+        existing_logs = sorted(
+            name for name in os.listdir(self.log_path)
+            if name.endswith("_audit.jsonl")
+        )
+        if existing_logs:
+            return os.path.join(self.log_path, existing_logs[-1])
+        date_stamp = datetime.now().strftime("%Y-%m-%d")
+        return os.path.join(self.log_path, f"{date_stamp}_audit.jsonl")
+
+    def save_log(self, log_dict: Dict) -> None:
+        with open(self.log_file, "a", encoding="utf-8") as file_handle:
+            file_handle.write(json.dumps(log_dict, ensure_ascii=False, default=str) + "\n")
+
+    def load_all_logs(self) -> List[Dict]:
+        logs: List[Dict] = []
+        if not os.path.exists(self.log_file):
+            return logs
+
+        with open(self.log_file, "r", encoding="utf-8") as file_handle:
+            for line in file_handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    logs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return logs
+
+    def export_logs(self, logs: List[Dict], fmt: str, output_file: str) -> str:
+        if fmt == "json":
+            with open(output_file, 'w', encoding='utf-8') as file_handle:
+                json.dump(logs, file_handle, indent=2, default=str, ensure_ascii=False)
+        elif fmt == "csv":
+            import csv
+            output_file = output_file.replace('.json', '.csv')
+            if logs:
+                keys = logs[0].keys()
+                with open(output_file, 'w', newline='', encoding='utf-8') as file_handle:
+                    writer = csv.DictWriter(file_handle, fieldnames=keys)
+                    writer.writeheader()
+                    writer.writerows(logs)
+        return output_file
+
+
 class AuditLogger:
     """Ghi lại kiểm tra"""
     def __init__(self, log_path: str = "audit_logs", storage: Optional['AuditStorage'] = None):
@@ -104,11 +158,7 @@ class AuditLogger:
         if storage is not None:
             self.storage = storage
         else:
-            from .db import get_working_connection_string
-            from .storage_backend import SqlServerAuditStorage
-
-            conn_str = get_working_connection_string()
-            self.storage = SqlServerAuditStorage(conn_str)
+            self.storage = FileAuditStorage(log_path)
             
         self.current_logs: List[AuditLog] = []
         self._load_logs()

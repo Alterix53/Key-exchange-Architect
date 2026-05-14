@@ -26,6 +26,12 @@ import threading
 import argparse
 from datetime import datetime
 
+# Ensure startup banners and status messages don't crash on non-UTF-8 consoles.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Đảm bảo import được module src
 sys.path.insert(0, os.path.dirname(__file__))
 
