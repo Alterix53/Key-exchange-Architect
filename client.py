@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional, List
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.backends import default_backend
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
@@ -61,13 +62,19 @@ class IAMDemoClient:
         self.reader = None
         self.session_id: Optional[str] = None
         self.user_info: Optional[Dict] = None
-        
+
+        # Local keystore passphrase policy: reuse login password (in-memory only)
+        self._keystore_passphrase: Optional[str] = None
+
         # Crypto
         self.channel = SecureTransmissionChannel()
         self.replay_protector = ReplayProtector(time_window_seconds=30)
+
+        # NOTE: This keypair is used for the initial mutual-auth/login proof.
+        # The CSR/certificate identity key is loaded from the client keystore after login.
         self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self.public_key = self.private_key.public_key()
-        
+
         # E2E Chat state
         self.in_chat_mode = False
         self.chat_peer_id: Optional[str] = None
@@ -111,6 +118,153 @@ class IAMDemoClient:
         leaf_cert = load_cert_from_pem(cert_chain[0])
         return leaf_cert.public_key()
 
+    def _client_keystore_root(self) -> str:
+        return os.path.join("data", "client_keystore")
+
+    def _identity_keystore_dir(self, user_id: str) -> str:
+        return os.path.join(self._client_keystore_root(), str(user_id), "identity")
+
+    def _identity_metadata_path(self, user_id: str) -> str:
+        return os.path.join(self._identity_keystore_dir(user_id), "metadata.json")
+
+    def _identity_key_path(self, user_id: str, version: int) -> str:
+        return os.path.join(self._identity_keystore_dir(user_id), f"identity_key_v{version}.pem")
+
+    def _load_identity_metadata(self, user_id: str) -> Dict[str, Any]:
+        meta_path = self._identity_metadata_path(user_id)
+        if not os.path.exists(meta_path):
+            return {
+                "active_version": 0,
+                "algorithm": "RSA",
+                "key_size": 2048,
+                "created_at": None,
+                "rotated_at": None,
+            }
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _save_identity_metadata(self, user_id: str, meta: Dict[str, Any]) -> None:
+        os.makedirs(self._identity_keystore_dir(user_id), exist_ok=True)
+        with open(self._identity_metadata_path(user_id), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    def _cleanup_old_identity_keys(self, user_id: str, keep_version: int) -> None:
+        """Delete old identity keys from keystore (keep only keep_version).
+
+        This enforces: rotate = do not keep/ use old private keys.
+        """
+        ks_dir = self._identity_keystore_dir(user_id)
+        keep_name = f"identity_key_v{int(keep_version)}.pem"
+        deleted = []
+
+        try:
+            for name in os.listdir(ks_dir):
+                if not (name.startswith("identity_key_v") and name.endswith(".pem")):
+                    continue
+                if name == keep_name:
+                    continue
+
+                path = os.path.join(ks_dir, name)
+                try:
+                    os.remove(path)
+                    deleted.append(name)
+                except Exception as e:
+                    print(f"{Colors.WARNING}[KEYSTORE] ⚠ Không thể xóa key cũ '{name}': {e}{Colors.ENDC}")
+        except FileNotFoundError:
+            return
+
+        if deleted:
+            print(f"{Colors.OKCYAN}[KEY ROTATE] Đã xóa key cũ khỏi keystore: {', '.join(deleted)}{Colors.ENDC}")
+
+    def _load_or_create_identity_key(self, user_id: str, passphrase: str) -> Tuple[Any, int, bool]:
+        """Load active identity key from client keystore.
+
+        Returns:
+            (private_key_obj, active_version, created_new)
+        """
+        if not passphrase:
+            raise ValueError("Thiếu passphrase để mở keystore (password đăng nhập).")
+
+        os.makedirs(self._identity_keystore_dir(user_id), exist_ok=True)
+        meta = self._load_identity_metadata(user_id)
+        active_v = int(meta.get("active_version") or 0)
+
+        if active_v > 0:
+            key_path = self._identity_key_path(user_id, active_v)
+            if os.path.exists(key_path):
+                try:
+                    with open(key_path, "rb") as f:
+                        key_bytes = f.read()
+                    priv = serialization.load_pem_private_key(
+                        key_bytes,
+                        password=passphrase.encode("utf-8"),
+                        backend=default_backend(),
+                    )
+                    return priv, active_v, False
+                except Exception as e:
+                    print(f"{Colors.WARNING}[KESTORE] ⚠ Không mở được identity key v{active_v} (có thể do đổi password). Sẽ tạo key mới. Lỗi: {e}{Colors.ENDC}")
+
+        # Create brand-new identity key (rotate-from-zero or recovery)
+        new_v = active_v + 1
+        priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        enc = serialization.BestAvailableEncryption(passphrase.encode("utf-8"))
+        pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=enc,
+        )
+        key_path = self._identity_key_path(user_id, new_v)
+        with open(key_path, "wb") as f:
+            f.write(pem)
+
+        now = datetime.now().isoformat()
+        meta.update({
+            "active_version": new_v,
+            "algorithm": "RSA",
+            "key_size": 2048,
+            "created_at": meta.get("created_at") or now,
+            "rotated_at": now,
+        })
+        self._save_identity_metadata(user_id, meta)
+        self._cleanup_old_identity_keys(user_id, keep_version=new_v)
+
+        return priv, new_v, True
+
+    def _rotate_identity_key(self, user_id: str, passphrase: str) -> Tuple[Any, int]:
+        """Hard rotate: generate a completely new key and mark it active."""
+        meta = self._load_identity_metadata(user_id)
+        old_v = int(meta.get("active_version") or 0)
+        new_v = old_v + 1
+
+        os.makedirs(self._identity_keystore_dir(user_id), exist_ok=True)
+
+        priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        enc = serialization.BestAvailableEncryption(passphrase.encode("utf-8"))
+        pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=enc,
+        )
+        key_path = self._identity_key_path(user_id, new_v)
+        with open(key_path, "wb") as f:
+            f.write(pem)
+
+        now = datetime.now().isoformat()
+        meta.update({
+            "active_version": new_v,
+            "algorithm": "RSA",
+            "key_size": 2048,
+            "created_at": meta.get("created_at") or now,
+            "rotated_at": now,
+        })
+        self._save_identity_metadata(user_id, meta)
+        self._cleanup_old_identity_keys(user_id, keep_version=new_v)
+
+        print(f"{Colors.OKCYAN}[KEY ROTATE] Đã tạo key mới HOÀN TOÀN (không dùng key cũ). old=v{old_v} → new=v{new_v}{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}[KEY ROTATE] Keystore path: {key_path}{Colors.ENDC}")
+
+        return priv, new_v
+
     def _perform_hello_csr(self) -> bool:
         """hello {CSR} -> welcome {client_cert_chain, server_cert_chain}."""
         if not self.user_info:
@@ -126,6 +280,7 @@ class IAMDemoClient:
             return False
 
         csr = create_csr(user_id, "IAM Security System", self.private_key)
+        print(f"{Colors.OKCYAN}[CSR] → Đang gửi CSR (key hiện tại trong keystore) để xin certificate mới...{Colors.ENDC}")
         res = self._sync_request(
             {
                 "type": "hello",
@@ -537,32 +692,35 @@ class IAMDemoClient:
             self.user_info = res.get("user")
             self.username = username
             print_success(f"Đăng nhập thành công! Xin chào, {self.user_info.get('username')}.")
-            
-            # --- START FIX PERSISTENT RSA KEYS CHO E2E ---
-            os.makedirs("demo_keys", exist_ok=True)
-            priv_path = os.path.join("demo_keys", f"{self.user_info.get('user_id')}_private.pem")
-            
-            from cryptography.hazmat.backends import default_backend
-            if os.path.exists(priv_path):
-                # Tải khóa cũ nếu đã có
-                with open(priv_path, "rb") as f:
-                    self.private_key = serialization.load_pem_private_key(f.read(), password=None, backend=default_backend())
-                self.public_key = self.private_key.public_key()
+
+            # Keystore policy: reuse login password as passphrase (in-memory only)
+            self._keystore_passphrase = password
+
+            # Load/Create identity key from client keystore (this key signs CSR and binds the new certificate)
+            user_id = self.user_info.get("user_id")
+            try:
+                identity_priv, identity_v, created_new = self._load_or_create_identity_key(user_id, self._keystore_passphrase)
+            except Exception as e:
+                print_error(f"Không thể mở/tạo identity key trong client keystore: {e}")
+                self.session_id = None
+                self.user_info = None
+                self._keystore_passphrase = None
+                return
+
+            self.private_key = identity_priv
+            self.public_key = self.private_key.public_key()
+
+            if created_new:
+                print(f"{Colors.OKCYAN}[KEYSTORE] ✓ Đã tạo identity key mới v{identity_v} trong keystore (RSA-2048, encrypted).{Colors.ENDC}")
             else:
-                # Lưu khóa mới nếu chưa có
-                with open(priv_path, "wb") as f:
-                    f.write(self.private_key.private_bytes(
-                        encoding=serialization.Encoding.PEM,
-                        format=serialization.PrivateFormat.TraditionalOpenSSL,
-                        encryption_algorithm=serialization.NoEncryption()
-                    ))
+                print(f"{Colors.OKCYAN}[KEYSTORE] ✓ Đã tải identity key v{identity_v} từ keystore (RSA-2048, encrypted).{Colors.ENDC}")
 
             if not self._perform_hello_csr():
                 print_error("Không thể hoàn tất hello/welcome với CSR. Hủy phiên đăng nhập.")
                 self.session_id = None
                 self.user_info = None
+                self._keystore_passphrase = None
                 return
-            # --- END FIX ---
 
     def do_register(self):
         print_header("Đăng ký tài khoản mới")
@@ -619,6 +777,8 @@ class IAMDemoClient:
             elif choice == "0":
                 self.session_id = None
                 self.user_info = None
+                self._keystore_passphrase = None
+                self.client_cert_chain = None
                 print_success("Đã đăng xuất.")
             else:
                 print_error("Không hợp lệ!")
@@ -757,6 +917,27 @@ class IAMDemoClient:
                             print_success(revoke_res.get("message", "Chứng chỉ đã được thu hồi thành công"))
                             crls_updated = revoke_res.get("crls", [])
                             print(f"ℹ️  CRL đã được cập nhật ({len(crls_updated)} entries)")
+
+                            # After revoke: rotate identity key (brand-new) and request a new certificate via CSR
+                            try:
+                                if not self.user_info or not self._keystore_passphrase:
+                                    raise ValueError("Thiếu user_info hoặc passphrase để rotate key")
+
+                                uid = self.user_info.get("user_id")
+                                self.current_crls = crls_updated
+
+                                new_priv, new_v = self._rotate_identity_key(uid, self._keystore_passphrase)
+                                self.private_key = new_priv
+                                self.public_key = self.private_key.public_key()
+
+                                print(f"{Colors.OKCYAN}[CERT] Bạn đã rotate key. Hệ thống sẽ xin chứng chỉ mới gắn với key mới ngay bây giờ.{Colors.ENDC}")
+                                if not self._perform_hello_csr():
+                                    print_error("Rotate key xong nhưng xin chứng chỉ mới thất bại. Bạn có thể thử đăng nhập lại.")
+                                else:
+                                    print_success("Đã xin chứng chỉ mới thành công (CSR mới + key mới).")
+                            except Exception as e:
+                                print_error(f"Không thể rotate key / xin chứng chỉ mới: {e}")
+
                             break
                     else:
                         print_error("Đã hủy yêu cầu thu hồi")

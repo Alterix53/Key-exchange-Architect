@@ -143,3 +143,11 @@ class PKIClient:
         """
         response = self._call("get_crls", {})
         return response.get("result", [])
+    
+    def revoke_cert_by_serial(self, serial_number: int) -> bool:
+        """
+        Thu hồi certificate theo serial number.
+        Returns: True nếu thành công, False nếu thất bại.
+        """
+        response = self._call("revoke_cert", {"serial_number": serial_number})
+        return response.get("result", False)

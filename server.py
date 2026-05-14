@@ -70,6 +70,7 @@ class IAMBackendServer:
         # lưu dữ liệu trong sql
         print("[INIT] Đang tải các phân hệ IAM (Backend: sqlserver)...")
 
+        # Khởi tạo storage backed SQL
         from src.db import get_working_connection_string
         from src.storage_backend import (
             SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage,
@@ -77,6 +78,7 @@ class IAMBackendServer:
         )
         conn_str = get_working_connection_string()
 
+        # khởi tạo các thành phần liên kết với SQL Server
         user_storage = SqlServerUserStorage(conn_str)
         key_storage = SqlServerKeyStorage(conn_str)
         audit_storage = SqlServerAuditStorage(conn_str)
@@ -85,10 +87,14 @@ class IAMBackendServer:
 
         self.iam = IdentityManagementSystem(
             "demo_identity", storage=user_storage, session_storage=session_storage,
+            key_store=self.key_store  # Pass keystore so IAM can generate initial keys
         )
         self.key_store = KeyStore("demo_keys", storage=key_storage)
         self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
 
+        # liên kết với Hệ thống PKI nhằm xin chứng chỉ
+        # Nếu thất bại kết nối PKI -> không có chứng chỉ
+        # -> không thể thực hiện Mutual Auth → tất cả các API yêu cầu auth sẽ thất bại (demo lỗi PKI)
         self.pki = PKIClient()
         
         # --- MUTUAL AUTH: Khởi tạo Server Identity ---
@@ -153,6 +159,19 @@ class IAMBackendServer:
                 f.write(self.server_cert_pem)
             print("[SERVER] Đã cấp Server Certificate mới qua CSR (IAM-Server).")
         # --- END MUTUAL AUTH ---
+        
+        # Generate initial account key for server and store to keystore
+        try:
+            server_key_id = "server_initial"
+            self.key_store.generate_symmetric_key(
+                key_id=server_key_id,
+                owner="server",
+                purpose="initial account Key",
+                algorithm="AES-256"
+            )
+            print(f"[SERVER] ✓ Generated initial key for server: {server_key_id}")
+        except Exception as e:
+            print(f"[SERVER] ⚠ Failed to generate server initial key: {e}")
         
         self.channel = SecureTransmissionChannel()
         self.replay_protector = ReplayProtector(time_window_seconds=30)

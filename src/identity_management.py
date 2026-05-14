@@ -198,7 +198,8 @@ class IdentityManagementSystem:
     """Hệ thống quản lý danh tính"""
     def __init__(self, storage_path: str = "iam_storage",
                  storage: Optional['UserStorage'] = None,
-                 session_storage: Optional['SessionStorage'] = None):
+                 session_storage: Optional['SessionStorage'] = None,
+                 key_store: Optional['KeyStore'] = None):
         self.storage_path = storage_path
         
         if storage is not None:
@@ -217,6 +218,9 @@ class IdentityManagementSystem:
             from .storage_backend import SqlServerSessionStorage
             conn_str = get_working_connection_string()
             self.session_storage = SqlServerSessionStorage(conn_str)
+        
+        # Store reference to KeyStore (optional, for auto key generation on user creation)
+        self.key_store = key_store
         
         self.users: Dict[str, User] = {}
         self.sessions: Dict[str, Session] = {}
@@ -251,7 +255,7 @@ class IdentityManagementSystem:
     
     def create_user(self, username: str, email: str, password:  str,
                    roles: Optional[List[Role]] = None) -> User:
-        """Tạo người dùng mới"""
+        """Tạo người dùng mới và tự động sinh initial account key"""
         if roles is None:
             roles = [Role.USER]
         
@@ -262,6 +266,21 @@ class IdentityManagementSystem:
         self.users[user_id] = user
         
         self._save_user(user)
+        
+        # Auto-generate initial account key and store to keystore
+        if self.key_store is not None:
+            try:
+                key_id = f"user_{user_id}_initial"
+                self.key_store.generate_symmetric_key(
+                    key_id=key_id,
+                    owner=user_id,
+                    purpose="initial account Key",
+                    algorithm="AES-256"
+                )
+                print(f"[IAM] ✓ Generated initial key for user {username}: {key_id}")
+            except Exception as e:
+                print(f"[IAM] ⚠ Failed to generate initial key for user {username}: {e}")
+        
         return user
     
     def authenticate_user(self, username: str, password: str, 
