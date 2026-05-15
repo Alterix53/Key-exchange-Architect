@@ -81,6 +81,11 @@ class KeyStorage(ABC):
         pass
 
     @abstractmethod
+    def delete_public_key_bytes(self, key_id: str) -> None:
+        """Xóa khóa công khai RSA khỏi keystore"""
+        pass
+
+    @abstractmethod
     def save_metadata(self, key_id: str, metadata_dict: Dict) -> None:
         """Lưu metadata của khóa"""
         pass
@@ -362,6 +367,15 @@ class SqlServerKeyStorage(KeyStorage):
 
     def load_public_key_bytes(self, key_id: str) -> Optional[bytes]:
         return self._load_key_data(key_id, 'public')
+    
+    def delete_public_key_bytes(self, key_id: str) -> None:
+        """Xóa khóa công khai RSA khỏi keystore"""
+        import pyodbc
+        conn = pyodbc.connect(self.connection_string, autocommit=True)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM KeysData WHERE key_id = ? AND key_type = ?", (key_id, 'public'))
+        conn.close()
+        
         
     def _upsert_key_data(self, key_id: str, key_type: str, data: bytes) -> None:
         import pyodbc

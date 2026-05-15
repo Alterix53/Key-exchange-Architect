@@ -253,34 +253,23 @@ class IdentityManagementSystem:
         new_hash = self.hash_password(password, salt)
         return new_hash == password_hash
     
-    def create_user(self, username: str, email: str, password:  str,
+    def create_user(self, username: str, email: str, password: str,
                    roles: Optional[List[Role]] = None) -> User:
-        """Tạo người dùng mới và tự động sinh initial account key"""
+        """Tạo người dùng mới (RA: xác lập danh tính qua credential).
+
+        Không sinh RSA key tại đây — client tự sinh key và đẩy public key lên
+        sau khi đăng nhập thành công qua register_pubkey (enrollment phase).
+        """
         if roles is None:
             roles = [Role.USER]
-        
+
         user_id = secrets.token_hex(8)
         password_hash = self.hash_password(password)
-        
+
         user = User(user_id, username, email, password_hash, roles)
         self.users[user_id] = user
-        
         self._save_user(user)
-        
-        # Auto-generate initial account key and store to keystore
-        if self.key_store is not None:
-            try:
-                key_id = f"user_{user_id}_initial"
-                self.key_store.generate_symmetric_key(
-                    key_id=key_id,
-                    owner=user_id,
-                    purpose="initial account Key",
-                    algorithm="AES-256"
-                )
-                print(f"[IAM] ✓ Generated initial key for user {username}: {key_id}")
-            except Exception as e:
-                print(f"[IAM] ⚠ Failed to generate initial key for user {username}: {e}")
-        
+
         return user
     
     def authenticate_user(self, username: str, password: str, 

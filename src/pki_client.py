@@ -144,6 +144,20 @@ class PKIClient:
         response = self._call("get_crls", {})
         return response.get("result", [])
     
+    def revoke(self, subject_cn: str) -> bool:
+        """
+        Thu hồi certificate theo subject CN (duck-type của PKISystem.revoke).
+        Returns: True nếu thành công, False nếu không tìm thấy certificate.
+        Raises: Exception nếu không kết nối được tới PKI Server.
+        """
+        try:
+            self._call("revoke_cert", {"subject_cn": subject_cn})
+            return True
+        except Exception as e:
+            if "không tồn tại" in str(e):
+                return False
+            raise
+
     def revoke_cert_by_serial(self, serial_number: int) -> bool:
         """
         Thu hồi certificate theo serial number.

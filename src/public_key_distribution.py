@@ -143,7 +143,7 @@ class RootCA:
         self.ca_cert_path = os.path.join(self.certs_dir, "root.crt")
         self.crl_path = os.path.join(self.certs_dir, "root.crl")
 
-        self._revoked_serials: List[Tuple[int, datetime]] = []
+        self._revoked_serials: List[Tuple[int, datetime, Optional[x509.ReasonFlags]]] = []
 
         if os.path.exists(self.ca_key_path) and os.path.exists(self.ca_cert_path):
             # Load existing Root CA
@@ -258,12 +258,21 @@ class RootCA:
 
         return builder.sign(self.private_key, hashes.SHA256())
 
-    def revoke_certificate(self, serial_number: int):
-        """Thu hồi certificate bằng serial number."""
-        self._revoked_serials.append((serial_number, datetime.utcnow()))
+    def revoke_certificate(self, serial_number: int,
+                           reason: Optional[x509.ReasonFlags] = None):
+        """Thu hồi certificate bằng serial number.
+
+        Args:
+            reason: RFC 5280 reason code (x509.ReasonFlags.*).
+                    None → unspecified. Thường dùng:
+                    - key_compromise     : user chủ động revoke (bị lộ key)
+                    - superseded         : cert hết hạn / key rotation
+        """
+        self._revoked_serials.append((serial_number, datetime.utcnow(), reason))
         self._generate_crl()
-        print(f"[Root CA] Đã thu hồi certificate serial={format(serial_number, 'x')[:16]}...")
-        
+        reason_str = reason.name if reason else "unspecified"
+        print(f"[Root CA] Đã thu hồi certificate serial={format(serial_number, 'x')[:16]}... reason={reason_str}")
+
         if self.audit_logger:
             try:
                 self.audit_logger.log_event(
@@ -275,6 +284,7 @@ class RootCA:
                     details={
                         "ca_level": "root",
                         "serial_number": format(serial_number, "x")[:16],
+                        "reason": reason_str,
                         "timestamp": datetime.utcnow().isoformat()
                     }
                 )
@@ -291,14 +301,16 @@ class RootCA:
             .next_update(now + timedelta(days=7))
         )
 
-        for serial, revocation_date in self._revoked_serials:
-            revoked = (
+        for entry in self._revoked_serials:
+            serial, revocation_date, reason = entry[0], entry[1], entry[2] if len(entry) > 2 else None
+            rb = (
                 x509.RevokedCertificateBuilder()
                 .serial_number(serial)
                 .revocation_date(revocation_date)
-                .build()
             )
-            builder = builder.add_revoked_certificate(revoked)
+            if reason is not None:
+                rb = rb.add_extension(x509.CRLReason(reason), critical=False)
+            builder = builder.add_revoked_certificate(rb.build())
 
         crl = builder.sign(self.private_key, hashes.SHA256())
         with open(self.crl_path, "wb") as f:
@@ -310,8 +322,13 @@ class RootCA:
             with open(self.crl_path, "rb") as f:
                 crl = x509.load_pem_x509_crl(f.read())
             for revoked in crl:
+                try:
+                    reason_ext = revoked.extensions.get_extension_for_class(x509.CRLReason)
+                    reason = reason_ext.value.reason
+                except x509.ExtensionNotFound:
+                    reason = None
                 self._revoked_serials.append(
-                    (revoked.serial_number, revoked.revocation_date)
+                    (revoked.serial_number, revoked.revocation_date, reason)
                 )
 
     def get_crl(self) -> x509.CertificateRevocationList:
@@ -358,7 +375,7 @@ class IntermediateCA:
         self.ca_cert_path = os.path.join(self.certs_dir, "intermediate.crt")
         self.crl_path = os.path.join(self.certs_dir, "intermediate.crl")
 
-        self._revoked_serials: List[Tuple[int, datetime]] = []
+        self._revoked_serials: List[Tuple[int, datetime, Optional[x509.ReasonFlags]]] = []
 
         if os.path.exists(self.ca_key_path) and os.path.exists(self.ca_cert_path):
             passphrase = get_pki_key_passphrase()
@@ -471,12 +488,21 @@ class IntermediateCA:
         
         return cert
 
-    def revoke_certificate(self, serial_number: int):
-        """Thu hồi certificate."""
-        self._revoked_serials.append((serial_number, datetime.utcnow()))
+    def revoke_certificate(self, serial_number: int,
+                           reason: Optional[x509.ReasonFlags] = None):
+        """Thu hồi certificate.
+
+        Args:
+            reason: RFC 5280 reason code (x509.ReasonFlags.*).
+                    None → unspecified. Thường dùng:
+                    - key_compromise : user chủ động revoke (bị lộ key)
+                    - superseded     : cert hết hạn / key rotation
+        """
+        self._revoked_serials.append((serial_number, datetime.utcnow(), reason))
         self._generate_crl()
-        print(f"[Intermediate CA] Đã thu hồi certificate serial={format(serial_number, 'x')[:16]}...")
-        
+        reason_str = reason.name if reason else "unspecified"
+        print(f"[Intermediate CA] Đã thu hồi certificate serial={format(serial_number, 'x')[:16]}... reason={reason_str}")
+
         if self.audit_logger:
             try:
                 from .audit_logging import AuditEventType
@@ -489,6 +515,7 @@ class IntermediateCA:
                     details={
                         "ca_level": "intermediate",
                         "serial_number": format(serial_number, "x")[:16],
+                        "reason": reason_str,
                         "timestamp": datetime.utcnow().isoformat()
                     }
                 )
@@ -503,14 +530,16 @@ class IntermediateCA:
             .last_update(now)
             .next_update(now + timedelta(days=7))
         )
-        for serial, rev_date in self._revoked_serials:
-            revoked = (
+        for entry in self._revoked_serials:
+            serial, rev_date, reason = entry[0], entry[1], entry[2] if len(entry) > 2 else None
+            rb = (
                 x509.RevokedCertificateBuilder()
                 .serial_number(serial)
                 .revocation_date(rev_date)
-                .build()
             )
-            builder = builder.add_revoked_certificate(revoked)
+            if reason is not None:
+                rb = rb.add_extension(x509.CRLReason(reason), critical=False)
+            builder = builder.add_revoked_certificate(rb.build())
 
         crl = builder.sign(self.private_key, hashes.SHA256())
         with open(self.crl_path, "wb") as f:
@@ -521,8 +550,13 @@ class IntermediateCA:
             with open(self.crl_path, "rb") as f:
                 crl = x509.load_pem_x509_crl(f.read())
             for revoked in crl:
+                try:
+                    reason_ext = revoked.extensions.get_extension_for_class(x509.CRLReason)
+                    reason = reason_ext.value.reason
+                except x509.ExtensionNotFound:
+                    reason = None
                 self._revoked_serials.append(
-                    (revoked.serial_number, revoked.revocation_date)
+                    (revoked.serial_number, revoked.revocation_date, reason)
                 )
 
     def get_crl(self) -> x509.CertificateRevocationList:
@@ -619,14 +653,18 @@ class RegistrationAuthority:
 
         print(f"[RA] ✓ Subject name hợp lệ: {subject_cn}")
 
-        # === Bước 3: Kiểm tra trùng lặp ===
+        # === Bước 3: Kiểm tra cert hiện có ===
         existing = self.repository.get_certificate(subject_cn)
         if existing is not None:
-            # Kiểm tra cert cũ còn hiệu lực không
             if existing.not_valid_after > datetime.utcnow():
-                print(f"[RA] ⚠ Certificate cho {subject_cn} đã tồn tại và còn hiệu lực.")
-                print(f"[RA]   → Xử lý như Key Pair Update: thu hồi cert cũ, cấp cert mới.")
-                self.ca.revoke_certificate(existing.serial_number)
+                # Cert còn hiệu lực → trả về cert cũ, không revoke
+                print(f"[RA] ✓ Certificate cho {subject_cn} còn hiệu lực — dùng lại, không cấp mới.")
+                return existing
+            else:
+                # Cert hết hạn → revoke vào CRL rồi cấp mới
+                print(f"[RA] ⚠ Certificate cho {subject_cn} đã hết hạn — thu hồi và cấp mới.")
+                self.ca.revoke_certificate(existing.serial_number,
+                                           reason=x509.ReasonFlags.superseded)
                 self.repository.remove_certificate(subject_cn)
 
         # === Bước 4: Chuyển CSR cho Intermediate CA cấp cert ===
@@ -662,10 +700,11 @@ class RegistrationAuthority:
             except Exception as e:
                 print(f"[RA] ⚠ Lỗi ghi audit log (renewal): {e}")
 
-        # Thu hồi cert cũ nếu có
+        # Thu hồi cert cũ nếu có (key rotation → superseded)
         existing = self.repository.get_certificate(subject_cn)
         if existing is not None:
-            self.ca.revoke_certificate(existing.serial_number)
+            self.ca.revoke_certificate(existing.serial_number,
+                                       reason=x509.ReasonFlags.superseded)
             self.repository.remove_certificate(subject_cn)
             print(f"[RA] Đã thu hồi certificate cũ.")
 
@@ -681,7 +720,9 @@ class RegistrationAuthority:
             print(f"[RA] ❌ Không tìm thấy certificate cho: {subject_cn}")
             return False
 
-        self.ca.revoke_certificate(existing.serial_number)
+        # User chủ động xin revoke (bị lộ key) → key_compromise
+        self.ca.revoke_certificate(existing.serial_number,
+                                   reason=x509.ReasonFlags.key_compromise)
         self.repository.remove_certificate(subject_cn)
         print(f"[RA] ✓ Đã thu hồi certificate cho: {subject_cn}")
         

@@ -469,7 +469,12 @@ class IAMBackendServer:
         })
 
     def handle_revoke_cert(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
-        """Xin thu hồi certificate của chính user (khi bị lộ)."""
+        """Xin thu hồi certificate của chính user (khi bị lộ).
+
+        Sau khi thu hồi thành công, tự động sinh cặp khóa RSA mới:
+        - Private key export ra file và trả về cho user (PEM)
+        - Public key lưu vào DB với purpose 'new public key'
+        """
         # Kiểm tra user có certificate không
         cert = self.pki.lookup(user_id)
         if cert is None:
@@ -493,7 +498,7 @@ class IAMBackendServer:
 
             # Thu hồi thành công - lấy CRL mới cập nhật
             crls = self.pki.get_all_crls_pem()
-            
+
             self.audit_logger.log_event(
                 AuditEventType.CERT_REVOKED,
                 user_id,
@@ -503,11 +508,40 @@ class IAMBackendServer:
                 details={"serial_number": format(cert.serial_number, "x"), "reason": "User requested revocation"}
             )
 
-            conn.send({
+            # Sinh cặp khóa RSA mới cho user — private key trả về user, public key lưu DB
+            new_private_key_pem = None
+            new_key_id = None
+            if self.key_store is not None:
+                try:
+                    new_key_id = f"user_{user_id}_key_{int(datetime.now().timestamp())}"
+                    new_key_id, _, new_private_key_pem = self.key_store.generate_asymmetric_key_pair(
+                        key_id=new_key_id,
+                        owner=user_id,
+                        purpose="new public key",
+                        key_size=2048,
+                    )
+                    self.audit_logger.log_event(
+                        AuditEventType.KEY_GENERATED,
+                        user_id,
+                        "backend",
+                        "rekey_after_revoke",
+                        "success",
+                        details={"new_key_id": new_key_id}
+                    )
+                except Exception as e:
+                    print(f"[Server] ⚠ Failed to generate new key after revocation for {user_id}: {e}")
+
+            response = {
                 "type": "revoke_cert_ok",
                 "message": f"Certificate của {user_id} đã được thu hồi thành công",
                 "crls": crls,
-            })
+            }
+            if new_private_key_pem:
+                response["new_private_key_pem"] = new_private_key_pem
+                response["new_key_id"] = new_key_id
+                response["message"] += ". Cặp khóa mới đã được tạo — hãy lưu private key và gửi CSR mới."
+
+            conn.send(response)
         except Exception as e:
             self.audit_logger.log_event(
                 AuditEventType.SYSTEM_ERROR,
@@ -578,6 +612,36 @@ class IAMBackendServer:
             
         keys = self.key_store.list_keys(owner=owner_filter)
         conn.send({"type": "key_list_res", "keys": keys})
+
+    def handle_register_pubkey(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
+        """Nhận public key do client tự sinh và lưu vào keystore."""
+        public_key_pem = req.get("public_key_pem")
+        key_id = req.get("key_id")
+        purpose = req.get("purpose", "initial public key")
+
+        if not public_key_pem or not key_id:
+            conn.send({"type": "error", "message": "Thiếu public_key_pem hoặc key_id"})
+            return
+
+        if self.key_store is None:
+            conn.send({"type": "error", "message": "KeyStore chưa được khởi tạo trên server"})
+            return
+
+        try:
+            self.key_store.register_public_key(
+                key_id=key_id,
+                owner=user_id,
+                purpose=purpose,
+                public_pem=public_key_pem.encode("utf-8"),
+            )
+            self.audit_logger.log_event(
+                AuditEventType.KEY_GENERATED, user_id, "backend",
+                "register_pubkey", "success",
+                details={"key_id": key_id, "purpose": purpose}
+            )
+            conn.send({"type": "register_pubkey_ok", "key_id": key_id})
+        except Exception as e:
+            conn.send({"type": "error", "message": f"Không thể lưu public key: {e}"})
 
     def handle_key_gen(self, req: Dict, conn: ClientConnection, user_id: str) -> None:
         """Sinh khóa mới"""
@@ -977,6 +1041,8 @@ class IAMBackendServer:
                     self.handle_audit_query(req, conn, user_id)
                 elif req_type == "key_list":
                     self.handle_key_list(req, conn, user_id)
+                elif req_type == "register_pubkey":
+                    self.handle_register_pubkey(req, conn, user_id)
                 elif req_type == "key_gen":
                     self.handle_key_gen(req, conn, user_id)
                 elif req_type == "kdc_keyreq":

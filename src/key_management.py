@@ -100,15 +100,21 @@ class KeyStore:
     
     def generate_asymmetric_key_pair(self, key_id: str, owner: str, purpose: str,
                                     key_size: int = 2048,
-                                    private_key_password: Optional[str] = None) -> Tuple[str, str, str]:
-        """Sinh cặp khóa RSA"""
+                                    private_key_password: Optional[str] = None,
+                                    export_dir: str = "user_keys") -> Tuple[str, str, str]:
+        """Sinh cặp khóa RSA.
+
+        Private key KHÔNG lưu vào DB — được export ra file PEM để trao cho người dùng
+        (user là người duy nhất nắm private key của mình).
+        Public key được lưu vào SQL với purpose đã chỉ định.
+        """
         private_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=key_size,
             backend=default_backend()
         )
         public_key = private_key.public_key()
-        
+
         metadata = KeyMetadata(
             key_id,
             owner,
@@ -118,8 +124,7 @@ class KeyStore:
             private_key_password_protected=bool(private_key_password)
         )
         self.keys_metadata[key_id] = metadata
-        
-        # Bảo vệ private key bằng password (nếu có), sau đó tiếp tục mã hóa bằng master key.
+
         if private_key_password:
             pem_encryption = serialization.BestAvailableEncryption(
                 private_key_password.encode('utf-8')
@@ -132,16 +137,23 @@ class KeyStore:
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=pem_encryption
         )
-        
+
         public_pem = public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
-        
-        encrypted_private = self._encrypt_key(private_pem)
-        self._save_private_key(key_id, encrypted_private, metadata)
+
+        # Export private key ra file — không lưu vào DB
+        os.makedirs(export_dir, exist_ok=True)
+        private_key_path = os.path.join(export_dir, f"{key_id}_private.pem")
+        with open(private_key_path, 'wb') as f:
+            f.write(private_pem)
+        print(f"[KeyStore] ✓ Private key exported to {private_key_path} (not stored in DB)")
+
+        # Chỉ lưu public key + metadata vào DB
         self._save_public_key(key_id, public_pem)
-        
+        self.storage.save_metadata(key_id, metadata.to_dict())
+
         return key_id, f"{key_id}_pub", private_pem.decode('utf-8')
     
     def generate_entity_master_key(self, entity_id: str, ttl_days: int = 365) -> str:
@@ -431,7 +443,51 @@ class KeyStore:
         if metadata is None:
             raise ValueError(f"Metadata của khóa {key_id} không tồn tại")
 
+        # Nếu là public key, export ra file trước khi xóa
+        if metadata.algorithm == "RSA":
+            try:
+                output_path = f"revoked_keys/{key_id}_public.pem"
+                self.export_public_key_to_file(key_id, output_path)
+                self.delete_public_key(key_id)
+            except Exception as e:
+                print(f"[KeyStore] ⚠ Warning when revoking RSA key {key_id}: {e}")
+
         metadata.is_active = False
         
         # Cập nhật metadata
         self.storage.save_metadata(key_id, metadata.to_dict())
+
+    def register_public_key(self, key_id: str, owner: str, purpose: str,
+                            public_pem: bytes, key_size: int = 2048) -> str:
+        """Đăng ký public key do client tự sinh vào keystore (không có private key).
+
+        Dùng khi client gửi public key của mình lên server sau khi tạo identity key.
+        """
+        metadata = KeyMetadata(key_id, owner, "RSA", key_size, purpose)
+        self.keys_metadata[key_id] = metadata
+        self._save_public_key(key_id, public_pem)
+        self.storage.save_metadata(key_id, metadata.to_dict())
+        print(f"[KeyStore] ✓ Registered public key {key_id} (purpose: {purpose})")
+        return key_id
+
+    def export_public_key_to_file(self, key_id: str, output_path: str) -> str:
+        """Lấy public key từ keystore và lưu thành file PEM.
+        Returns: đường dẫn file đã lưu
+        """
+        public_key_bytes = self.storage.load_public_key_bytes(key_id)
+        if public_key_bytes is None:
+            raise ValueError(f"Public key {key_id} không tồn tại trong keystore")
+        
+        # Tạo thư mục nếu chưa tồn tại
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        
+        with open(output_path, 'wb') as f:
+            f.write(public_key_bytes)
+        
+        print(f"[KeyStore] ✓ Exported public key {key_id} to {output_path}")
+        return output_path
+
+    def delete_public_key(self, key_id: str) -> None:
+        """Xóa public key khỏi keystore"""
+        self.storage.delete_public_key_bytes(key_id)
+        print(f"[KeyStore] ✓ Deleted public key {key_id} from keystore")

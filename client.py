@@ -152,14 +152,19 @@ class IAMDemoClient:
         with open(self._identity_metadata_path(user_id), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    def _cleanup_old_identity_keys(self, user_id: str, keep_version: int) -> None:
-        """Delete old identity keys from keystore (keep only keep_version).
+    def _archive_dir(self, user_id: str) -> str:
+        return os.path.join(self._client_keystore_root(), str(user_id), "archive")
 
-        This enforces: rotate = do not keep/ use old private keys.
+    def _cleanup_old_identity_keys(self, user_id: str, keep_version: int) -> None:
+        """Archive old identity keys instead of deleting.
+
+        Old private keys are moved to archive/ so encrypted data from previous
+        key versions can still be decrypted. Active key stays in identity/.
         """
         ks_dir = self._identity_keystore_dir(user_id)
+        archive_dir = self._archive_dir(user_id)
         keep_name = f"identity_key_v{int(keep_version)}.pem"
-        deleted = []
+        archived = []
 
         try:
             for name in os.listdir(ks_dir):
@@ -167,18 +172,34 @@ class IAMDemoClient:
                     continue
                 if name == keep_name:
                     continue
-
-                path = os.path.join(ks_dir, name)
+                src = os.path.join(ks_dir, name)
+                os.makedirs(archive_dir, exist_ok=True)
+                dst = os.path.join(archive_dir, name)
                 try:
-                    os.remove(path)
-                    deleted.append(name)
+                    os.rename(src, dst)
+                    archived.append(name)
                 except Exception as e:
-                    print(f"{Colors.WARNING}[KEYSTORE] ⚠ Không thể xóa key cũ '{name}': {e}{Colors.ENDC}")
+                    print(f"{Colors.WARNING}[KEYSTORE] ⚠ Không thể archive key '{name}': {e}{Colors.ENDC}")
         except FileNotFoundError:
             return
 
-        if deleted:
-            print(f"{Colors.OKCYAN}[KEY ROTATE] Deleted old keys: {', '.join(deleted)}{Colors.ENDC}")
+        if archived:
+            # Ghi metadata cho archive
+            meta_path = os.path.join(archive_dir, "archive_metadata.json")
+            archive_meta = {}
+            if os.path.exists(meta_path):
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    archive_meta = json.load(f)
+            for name in archived:
+                v = name.replace("identity_key_v", "").replace(".pem", "")
+                archive_meta[f"v{v}"] = {
+                    "filename": name,
+                    "archived_at": datetime.now().isoformat(),
+                    "reason": "superseded_by_new_key",
+                }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(archive_meta, f, indent=2, ensure_ascii=False)
+            print(f"{Colors.OKCYAN}[KEY ROTATE] Archived old keys: {', '.join(archived)}{Colors.ENDC}")
 
     def _load_or_create_identity_key(self, user_id: str, passphrase: str) -> Tuple[Any, int, bool]:
         """Load active identity key from client keystore.
@@ -221,6 +242,22 @@ class IAMDemoClient:
         with open(key_path, "wb") as f:
             f.write(pem)
 
+        # Export thêm bản plaintext ra user_keys/ để người dùng lưu giữ
+        export_dir = os.path.join("user_keys")
+        os.makedirs(export_dir, exist_ok=True)
+        export_path = os.path.join(export_dir, f"{user_id}_identity_v{new_v}_private.pem")
+        plaintext_pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        with open(export_path, "wb") as f:
+            f.write(plaintext_pem)
+
+        print(f"{Colors.OKCYAN}[KEYSTORE] Private key đã được export ra:{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}  Keystore (encrypted) : {key_path}{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}  Export (plaintext)   : {export_path}{Colors.ENDC}")
+
         now = datetime.now().isoformat()
         meta.update({
             "active_version": new_v,
@@ -253,6 +290,18 @@ class IAMDemoClient:
         with open(key_path, "wb") as f:
             f.write(pem)
 
+        # Export thêm bản plaintext ra user_keys/ để người dùng lưu giữ
+        export_dir = os.path.join("user_keys")
+        os.makedirs(export_dir, exist_ok=True)
+        export_path = os.path.join(export_dir, f"{user_id}_identity_v{new_v}_private.pem")
+        plaintext_pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        with open(export_path, "wb") as f:
+            f.write(plaintext_pem)
+
         now = datetime.now().isoformat()
         meta.update({
             "active_version": new_v,
@@ -265,7 +314,8 @@ class IAMDemoClient:
         self._cleanup_old_identity_keys(user_id, keep_version=new_v)
 
         print(f"{Colors.OKCYAN}[KEY ROTATE] Created new key (discarded old). v{old_v} -> v{new_v}{Colors.ENDC}")
-        print(f"{Colors.OKCYAN}[KEY ROTATE] Keystore path: {key_path}{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}[KEY ROTATE] Keystore (encrypted) : {key_path}{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}[KEY ROTATE] Export (plaintext)   : {export_path}{Colors.ENDC}")
 
         return priv, new_v
 
@@ -718,6 +768,26 @@ class IAMDemoClient:
                 print(f"{Colors.OKCYAN}[KEYSTORE] ✓ Đã tạo identity key mới v{identity_v} trong keystore (RSA-2048, encrypted).{Colors.ENDC}")
             else:
                 print(f"{Colors.OKCYAN}[KEYSTORE] ✓ Đã tải identity key v{identity_v} từ keystore (RSA-2048, encrypted).{Colors.ENDC}")
+
+            # Chỉ gửi public key lên server khi vừa sinh key mới
+            # (created_new = False nghĩa là key đã tồn tại và đã được đăng ký trước đó)
+            if created_new:
+                pub_pem = self.public_key.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                ).decode("utf-8")
+                key_id = f"user_{user_id}_identity_v{identity_v}"
+                purpose = "initial public key" if identity_v == 1 else "new public key"
+                reg_res = self._sync_request({
+                    "type": "register_pubkey",
+                    "key_id": key_id,
+                    "public_key_pem": pub_pem,
+                    "purpose": purpose,
+                }, "register_pubkey_ok")
+                if reg_res:
+                    print(f"{Colors.OKCYAN}[KEYSTORE] ✓ Public key đã lưu trên server: {key_id} ({purpose}).{Colors.ENDC}")
+                else:
+                    print(f"{Colors.WARNING}[KEYSTORE] ⚠ Không thể lưu public key lên server (tiếp tục đăng nhập).{Colors.ENDC}")
 
             if not self._perform_hello_csr():
                 print_error("Không thể hoàn tất hello/welcome với CSR. Hủy phiên đăng nhập.")
