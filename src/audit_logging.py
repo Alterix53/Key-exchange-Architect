@@ -3,14 +3,12 @@ Audit and Logging Module
 Ghi lại tất cả hoạt động để kiểm tra an toàn
 """
 
-import json
 import os
 from datetime import datetime
-from typing import Dict, List, Optional, TYPE_CHECKING
+from typing import Dict, List, Optional
 from enum import Enum
 
-if TYPE_CHECKING:
-    from .storage_backend import AuditStorage
+from .storage_backend import AuditStorage, SqlServerAuditStorage
 
 
 class AuditEventType(Enum):
@@ -97,96 +95,6 @@ class AuditLog:
         }
 
 
-class FileAuditStorage:
-    """Lưu trữ audit log dạng JSONL trong filesystem."""
-
-    def __init__(self, log_path: str):
-        self.log_path = log_path
-        os.makedirs(self.log_path, exist_ok=True)
-        self.log_file = self._resolve_log_file()
-
-    def _resolve_log_file(self) -> str:
-        existing_logs = sorted(
-            name for name in os.listdir(self.log_path)
-            if name.endswith("_audit.jsonl")
-        )
-        if existing_logs:
-            return os.path.join(self.log_path, existing_logs[-1])
-        date_stamp = datetime.now().strftime("%Y-%m-%d")
-        return os.path.join(self.log_path, f"{date_stamp}_audit.jsonl")
-
-    def save_log(self, log_dict: Dict) -> None:
-        with open(self.log_file, "a", encoding="utf-8") as file_handle:
-            file_handle.write(json.dumps(log_dict, ensure_ascii=False, default=str) + "\n")
-
-    def load_all_logs(self) -> List[Dict]:
-        logs: List[Dict] = []
-        if not os.path.exists(self.log_file):
-            return logs
-
-        with open(self.log_file, "r", encoding="utf-8") as file_handle:
-            for line in file_handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    logs.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        return logs
-
-    def export_logs(self, logs: List[Dict], fmt: str, output_file: str) -> str:
-        if fmt == "json":
-            with open(output_file, 'w', encoding='utf-8') as file_handle:
-                json.dump(logs, file_handle, indent=2, default=str, ensure_ascii=False)
-        elif fmt == "csv":
-            import csv
-            output_file = output_file.replace('.json', '.csv')
-            if logs:
-                keys = logs[0].keys()
-                with open(output_file, 'w', newline='', encoding='utf-8') as file_handle:
-                    writer = csv.DictWriter(file_handle, fieldnames=keys)
-                    writer.writeheader()
-                    writer.writerows(logs)
-        return output_file
-
-
-class HybridAuditStorage(AuditStorage):
-    """
-    Hybrid storage - writes audit logs to BOTH SQL Server AND JSON file.
-    Ensures audit logs are stored in both locations for redundancy and file-based viewing.
-    """
-    def __init__(self, connection_string: str, log_path: str = "demo_audit"):
-        # Import here to avoid circular import at module load time
-        from .storage_backend import SqlServerAuditStorage
-        self.sql_storage = SqlServerAuditStorage(connection_string)
-        self.file_storage = FileAuditStorage(log_path)
-    
-    def save_log(self, log_dict: Dict) -> None:
-        """Save log to both SQL Server and JSON file"""
-        try:
-            self.sql_storage.save_log(log_dict)
-        except Exception as e:
-            print(f"[AUDIT] Warning: Failed to save to SQL Server: {e}")
-        
-        try:
-            self.file_storage.save_log(log_dict)
-        except Exception as e:
-            print(f"[AUDIT] Warning: Failed to save to JSON file: {e}")
-    
-    def load_all_logs(self) -> List[Dict]:
-        """Load logs from SQL Server (primary source)"""
-        try:
-            return self.sql_storage.load_all_logs()
-        except Exception as e:
-            print(f"[AUDIT] Warning: Failed to load from SQL Server, falling back to file: {e}")
-            return self.file_storage.load_all_logs()
-    
-    def export_logs(self, logs: List[Dict], fmt: str, output_file: str) -> str:
-        """Export logs using SQL Server implementation"""
-        return self.sql_storage.export_logs(logs, fmt, output_file)
-
-
 class AuditLogger:
     """Ghi lại kiểm tra"""
     def __init__(self, log_path: str = "audit_logs", storage: Optional['AuditStorage'] = None):
@@ -194,7 +102,8 @@ class AuditLogger:
         if storage is not None:
             self.storage = storage
         else:
-            self.storage = FileAuditStorage(log_path)
+            from .db import get_working_connection_string
+            self.storage = SqlServerAuditStorage(get_working_connection_string())
             
         self.current_logs: List[AuditLog] = []
         self._load_logs()

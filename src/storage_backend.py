@@ -14,6 +14,9 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 import json
 import secrets
+from .security_config import (
+    is_secure_mode, wrap_master_key, unwrap_master_key,
+)
 
 
 # ============================================================
@@ -110,6 +113,34 @@ class AuditStorage(ABC):
     def export_logs(self, logs: List[Dict], fmt: str, output_file: str) -> str:
         """Xuất bản ghi ra file, trả về đường dẫn file đã xuất"""
         pass
+
+
+class MemoryAuditStorage(AuditStorage):
+    """Lưu audit trong RAM (unit test / demo offline); không ghi file log audit."""
+
+    def __init__(self):
+        self._logs: List[Dict] = []
+
+    def save_log(self, log_dict: Dict) -> None:
+        self._logs.append(dict(log_dict))
+
+    def load_all_logs(self) -> List[Dict]:
+        return list(self._logs)
+
+    def export_logs(self, logs: List[Dict], fmt: str, output_file: str) -> str:
+        if fmt == "json":
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(logs, f, indent=2, default=str, ensure_ascii=False)
+        elif fmt == "csv":
+            import csv
+            output_file = output_file.replace('.json', '.csv')
+            if logs:
+                keys = logs[0].keys()
+                with open(output_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=keys)
+                    writer.writeheader()
+                    writer.writerows(logs)
+        return output_file
 
 
 class SessionStorage(ABC):
@@ -292,9 +323,6 @@ class SqlServerKeyStorage(KeyStorage):
     def load_or_create_master_key(self) -> bytes:
         import pyodbc
         import secrets
-        from .security_config import (
-            is_secure_mode, wrap_master_key, unwrap_master_key,
-        )
         conn = pyodbc.connect(self.connection_string, autocommit=True)
         cursor = conn.cursor()
         cursor.execute("SELECT key_payload FROM KeysData WHERE key_id = 'master_key' AND key_type = 'master'")

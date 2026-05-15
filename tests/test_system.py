@@ -13,6 +13,7 @@ from src.key_management import KeyStore, KeyMetadata
 from src.identity_management import IdentityManagementSystem, Role, Permission
 from src.secure_transmission import SecureTransmissionChannel
 from src.audit_logging import AuditLogger, AuditEventType
+from src.storage_backend import MemoryAuditStorage
 from src.public_key_distribution import CertificateAuthority, verify_certificate, extract_public_key
 
 
@@ -340,19 +341,12 @@ class TestMutualAuthentication(LoggedTestCase):
 
 class TestAuditLogging(LoggedTestCase):
     """Test Audit Logging"""
-    
+
     def setUp(self):
         super().setUp()
-        self.test_path = "test_audit"
-        logger.info("Preparing audit test storage at %s", self.test_path)
-        if os.path.exists(self.test_path):
-            shutil.rmtree(self.test_path)
-        self.audit = AuditLogger(self.test_path)
-    
+        self.audit = AuditLogger("test_audit", storage=MemoryAuditStorage())
+
     def tearDown(self):
-        logger.info("Cleaning audit test storage at %s", self.test_path)
-        if os.path.exists(self.test_path):
-            shutil.rmtree(self.test_path)
         super().tearDown()
     
     def test_log_event(self):

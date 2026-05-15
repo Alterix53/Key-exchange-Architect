@@ -22,6 +22,8 @@ from cryptography.x509.oid import NameOID, ExtensionOID
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.exceptions import InvalidSignature
+from .security_config import get_pki_key_passphrase
+from .audit_logging import AuditEventType
 
 if TYPE_CHECKING:
     from .audit_logging import AuditLogger
@@ -145,7 +147,6 @@ class RootCA:
 
         if os.path.exists(self.ca_key_path) and os.path.exists(self.ca_cert_path):
             # Load existing Root CA
-            from .security_config import get_pki_key_passphrase
             passphrase = get_pki_key_passphrase()
             with open(self.ca_key_path, "rb") as f:
                 self.private_key = serialization.load_pem_private_key(
@@ -265,7 +266,6 @@ class RootCA:
         
         if self.audit_logger:
             try:
-                from .audit_logging import AuditEventType
                 self.audit_logger.log_event(
                     AuditEventType.CERT_REVOKED,
                     "system",
@@ -361,7 +361,6 @@ class IntermediateCA:
         self._revoked_serials: List[Tuple[int, datetime]] = []
 
         if os.path.exists(self.ca_key_path) and os.path.exists(self.ca_cert_path):
-            from .security_config import get_pki_key_passphrase
             passphrase = get_pki_key_passphrase()
             with open(self.ca_key_path, "rb") as f:
                 self.private_key = serialization.load_pem_private_key(
@@ -453,7 +452,6 @@ class IntermediateCA:
         
         if self.audit_logger:
             try:
-                from .audit_logging import AuditEventType
                 self.audit_logger.log_event(
                     AuditEventType.CERT_ISSUED,
                     subject_cn,
@@ -578,7 +576,6 @@ class RegistrationAuthority:
         
         if self.audit_logger:
             try:
-                from .audit_logging import AuditEventType
                 self.audit_logger.log_event(
                     AuditEventType.CERT_CSR_RECEIVED,
                     subject_cn,
@@ -598,7 +595,6 @@ class RegistrationAuthority:
             print(f"[RA] ❌ CSR signature không hợp lệ! Từ chối.")
             if self.audit_logger:
                 try:
-                    from .audit_logging import AuditEventType
                     self.audit_logger.log_event(
                         AuditEventType.CERT_VERIFICATION_FAILED,
                         subject_cn,
@@ -655,7 +651,6 @@ class RegistrationAuthority:
         
         if self.audit_logger:
             try:
-                from .audit_logging import AuditEventType
                 self.audit_logger.log_event(
                     AuditEventType.CERT_RENEWED,
                     subject_cn,

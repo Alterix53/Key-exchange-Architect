@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+from src.audit_logging import AuditLogger
 from src.secure_transmission import SecureTransmissionChannel, ReplayProtector
 from src.public_key_distribution import (
     verify_certificate_chain,
@@ -98,15 +99,9 @@ class IAMDemoClient:
         # Async responses routing
         self.pending_responses: Dict[str, Dict] = {}
         self._response_cv = threading.Condition()
-        
-        # Initialize audit logger (hybrid: file + database)
-        from src.audit_logging import AuditLogger
-        from src.storage_backend import HybridAuditStorage
-        from src.db import get_working_connection_string
-        
-        conn_str = get_working_connection_string()
-        audit_storage = HybridAuditStorage(conn_str, "demo_audit")
-        self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
+
+        # Audit: SQL Server only (same connection as configured in src.db)
+        self.audit_logger = AuditLogger("demo_audit")
 
     def _public_key_pem(self) -> str:
         return self.public_key.public_bytes(

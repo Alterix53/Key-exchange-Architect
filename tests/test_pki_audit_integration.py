@@ -15,7 +15,8 @@ from src.public_key_distribution import (
     PKISystem,
     create_csr,
 )
-from src.audit_logging import AuditLogger, AuditEventType
+from src.audit_logging import AuditLogger
+from src.storage_backend import MemoryAuditStorage
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 def test_pki_audit_logging():
@@ -23,8 +24,7 @@ def test_pki_audit_logging():
     
     # Create temporary directory for test
     test_dir = tempfile.mkdtemp(prefix="pki_audit_test_")
-    audit_dir = tempfile.mkdtemp(prefix="audit_test_")
-    
+
     try:
         print("=" * 70)
         print("TEST: PKI SYSTEM WITH AUDIT LOGGING INTEGRATION")
@@ -32,7 +32,7 @@ def test_pki_audit_logging():
         
         # 1. Initialize audit logger
         print("\n[1/5] Khởi tạo Audit Logger...")
-        audit_logger = AuditLogger(log_path=audit_dir)
+        audit_logger = AuditLogger("pki_audit_test", storage=MemoryAuditStorage())
         print("✓ Audit Logger khởi tạo thành công")
         
         # 2. Initialize PKI system with audit logger
@@ -115,7 +115,6 @@ def test_pki_audit_logging():
         # Cleanup
         try:
             shutil.rmtree(test_dir, ignore_errors=True)
-            shutil.rmtree(audit_dir, ignore_errors=True)
         except:
             pass
 

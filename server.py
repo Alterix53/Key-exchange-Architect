@@ -18,15 +18,17 @@ from typing import Any, Dict, Optional, List
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-#import keystore:
-from src.key_management import KeyStore
-
 # Import các components từ IAM Core Module
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.identity_management import IdentityManagementSystem, Role, Permission
 from src.key_management import KeyStore
 from src.audit_logging import AuditLogger, AuditEventType
 from src.pki_client import PKIClient
+from src.storage_backend import (
+    SqlServerUserStorage, SqlServerKeyStorage,
+    SqlServerSessionStorage, SqlServerKdcTicketStorage,
+)
+from src.security_config import get_pki_key_passphrase
+from src.db import get_working_connection_string
 from src.public_key_distribution import (
     create_csr,
     load_csr_from_pem,
@@ -74,18 +76,11 @@ class IAMBackendServer:
         print("[INIT] Loading IAM subsystems (Backend: sqlserver)...")
 
         # Khởi tạo storage backed SQL
-        from src.db import get_working_connection_string
-        from src.storage_backend import (
-            SqlServerUserStorage, SqlServerKeyStorage, SqlServerAuditStorage,
-            SqlServerSessionStorage, SqlServerKdcTicketStorage,
-            HybridAuditStorage,
-        )
         conn_str = get_working_connection_string()
 
         # khởi tạo các thành phần liên kết với SQL Server
         user_storage = SqlServerUserStorage(conn_str)
         key_storage = SqlServerKeyStorage(conn_str)
-        audit_storage = HybridAuditStorage(conn_str, "demo_audit")  # Hybrid: SQL + JSON
         session_storage = SqlServerSessionStorage(conn_str)
         self._kdc_ticket_storage = SqlServerKdcTicketStorage(conn_str)
 
@@ -94,7 +89,7 @@ class IAMBackendServer:
             "demo_identity", storage=user_storage, session_storage=session_storage,
             key_store=self.key_store  # Pass keystore so IAM can generate initial keys
         )
-        self.audit_logger = AuditLogger("demo_audit", storage=audit_storage)
+        self.audit_logger = AuditLogger("demo_audit")
 
         # Initialize server keys storage (file-based, not in database)
         self.server_keys_dir = "pki/server_keys"
@@ -112,7 +107,6 @@ class IAMBackendServer:
         server_priv_path = os.path.join(server_dir, "server_private.pem")
         server_cert_path = os.path.join(server_dir, "server_cert.pem")
 
-        from src.security_config import get_pki_key_passphrase
         pki_passphrase = get_pki_key_passphrase()
 
         if os.path.exists(server_priv_path):
