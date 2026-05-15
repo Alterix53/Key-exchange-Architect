@@ -637,7 +637,7 @@ class SqlServerKdcTicketStorage(KdcTicketStorage):
                 INSERT INTO KdcTickets (ticket_id, ks_b64, ida, idb, issued_at, expires_at, used)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (
-                t['ticket_id'], t['ks'], t['ida'], t['idb'],
+                t['ticket_id'], t['ticket_for_b'], t['ida'], t['idb'],
                 t.get('issued_at'), t['expires_at'], t.get('used', False),
             ))
         conn.close()
@@ -656,7 +656,7 @@ class SqlServerKdcTicketStorage(KdcTicketStorage):
             return None
         return {
             'ticket_id': row.ticket_id,
-            'ks': row.ks_b64,
+            'ticket_for_b': row.ks_b64,
             'ida': row.ida,
             'idb': row.idb,
             'issued_at': row.issued_at.isoformat() if row.issued_at else None,
@@ -681,7 +681,7 @@ class SqlServerKdcTicketStorage(KdcTicketStorage):
         tickets = {}
         for row in cursor.fetchall():
             tickets[row.ticket_id] = {
-                'ks': row.ks_b64,
+                'ticket_for_b': row.ks_b64,
                 'ida': row.ida,
                 'idb': row.idb,
                 'issued_at': row.issued_at.isoformat() if row.issued_at else None,

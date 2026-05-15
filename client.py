@@ -11,11 +11,11 @@ import os
 import sys
 import time
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List, Tuple
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as asym_padding
 from cryptography.hazmat.backends import default_backend
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -32,6 +32,9 @@ from src.secure_transmission import encrypt_json_with_key, decrypt_json_with_key
 
 
 CA_PULLIC_KEY_SRC = "pki/root/certs/root.crt"
+
+# Private key directories
+KEYSTORE_DIR    = os.path.join("data", "client_keystore")   # {KEYSTORE_DIR}/{user_id}/identity/identity_key_v{N}.pem  — encrypted
 
 # ANSI Colors
 class Colors:
@@ -66,6 +69,7 @@ class IAMDemoClient:
 
         # Local keystore passphrase policy: reuse login password (in-memory only)
         self._keystore_passphrase: Optional[str] = None
+        self._ks_name: str = ""  # set at login: username (or user_id fallback)
 
         # Crypto
         self.channel = SecureTransmissionChannel()
@@ -80,6 +84,7 @@ class IAMDemoClient:
         self.in_chat_mode = False
         self.chat_peer_id: Optional[str] = None
         self.chat_session_key: Optional[bytes] = None
+        self.chat_session_expires_at: Optional[datetime] = None
         self.chat_peer_public_key: Any = None
         self.ca_public_key_pem: Optional[str] = None
         self.server_public_key: Any = None
@@ -90,6 +95,8 @@ class IAMDemoClient:
 
         # E2E Chat invite/accept handshake state
         self.pending_chat_invite: Optional[Dict] = None
+        self.pending_ticket: Optional[str] = None
+        self.pending_ticket_id: Optional[str] = None
         self._chat_ready_event = threading.Event()
         self._chat_accepted = False
 
@@ -123,7 +130,7 @@ class IAMDemoClient:
         return leaf_cert.public_key()
 
     def _client_keystore_root(self) -> str:
-        return os.path.join("data", "client_keystore")
+        return KEYSTORE_DIR
 
     def _identity_keystore_dir(self, user_id: str) -> str:
         return os.path.join(self._client_keystore_root(), str(user_id), "identity")
@@ -242,21 +249,7 @@ class IAMDemoClient:
         with open(key_path, "wb") as f:
             f.write(pem)
 
-        # Export thêm bản plaintext ra user_keys/ để người dùng lưu giữ
-        export_dir = os.path.join("user_keys")
-        os.makedirs(export_dir, exist_ok=True)
-        export_path = os.path.join(export_dir, f"{user_id}_identity_v{new_v}_private.pem")
-        plaintext_pem = priv.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        with open(export_path, "wb") as f:
-            f.write(plaintext_pem)
-
-        print(f"{Colors.OKCYAN}[KEYSTORE] Private key đã được export ra:{Colors.ENDC}")
-        print(f"{Colors.OKCYAN}  Keystore (encrypted) : {key_path}{Colors.ENDC}")
-        print(f"{Colors.OKCYAN}  Export (plaintext)   : {export_path}{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}[KEYSTORE] Identity key lưu tại: {key_path} (encrypted bằng login password){Colors.ENDC}")
 
         now = datetime.now().isoformat()
         meta.update({
@@ -290,18 +283,6 @@ class IAMDemoClient:
         with open(key_path, "wb") as f:
             f.write(pem)
 
-        # Export thêm bản plaintext ra user_keys/ để người dùng lưu giữ
-        export_dir = os.path.join("user_keys")
-        os.makedirs(export_dir, exist_ok=True)
-        export_path = os.path.join(export_dir, f"{user_id}_identity_v{new_v}_private.pem")
-        plaintext_pem = priv.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        with open(export_path, "wb") as f:
-            f.write(plaintext_pem)
-
         now = datetime.now().isoformat()
         meta.update({
             "active_version": new_v,
@@ -314,8 +295,7 @@ class IAMDemoClient:
         self._cleanup_old_identity_keys(user_id, keep_version=new_v)
 
         print(f"{Colors.OKCYAN}[KEY ROTATE] Created new key (discarded old). v{old_v} -> v{new_v}{Colors.ENDC}")
-        print(f"{Colors.OKCYAN}[KEY ROTATE] Keystore (encrypted) : {key_path}{Colors.ENDC}")
-        print(f"{Colors.OKCYAN}[KEY ROTATE] Export (plaintext)   : {export_path}{Colors.ENDC}")
+        print(f"{Colors.OKCYAN}[KEY ROTATE] Identity key lưu tại: {key_path} (encrypted bằng login password){Colors.ENDC}")
 
         return priv, new_v
 
@@ -484,8 +464,9 @@ class IAMDemoClient:
             if "error" in self.pending_responses:
                 del self.pending_responses["error"]
 
-            self._send_req(req)
-            
+            if req:
+                self._send_req(req)
+
             # tính thời gian chờ, timeout nếu quá lâu
             start_time = time.time()
             while time.time() - start_time < timeout:
@@ -551,15 +532,11 @@ class IAMDemoClient:
                     
                     # Handle KDC invite - decrypt ticket and extract session key
                     ticket_enc = data.get("ticket")
-                    ticket_nonce = data.get("ticket_nonce")
                     ticket_id = data.get("ticket_id")
                     sender_id = data.get("sender_id", "?")
                     
-                    if all([ticket_enc, ticket_nonce, ticket_id]):
-                        # Try to decrypt ticket (server-side encryption, so we can't decrypt here)
-                        # Instead, we'll accept and extract the key from response later
+                    if ticket_enc and ticket_id:
                         self.pending_ticket = ticket_enc
-                        self.pending_ticket_nonce = ticket_nonce
                         self.pending_ticket_id = ticket_id
                         self.chat_peer_id = sender_id
                         print(f"\n{Colors.OKCYAN}[INVITE-KDC] {sender_id} mời bạn chat E2E (via KDC). Chọn '5b. Chế độ chat KDC' ở menu để phản hồi.{Colors.ENDC}")
@@ -751,9 +728,20 @@ class IAMDemoClient:
             self._keystore_passphrase = password
 
             # Load/Create identity key from client keystore (this key signs CSR and binds the new certificate)
-            user_id = self.user_info.get("user_id")
+            # Dùng username làm tên thư mục keystore (dễ nhận biết hơn user_id hash).
+            # self._ks_name được lưu lại để mọi thao tác keystore sau (rotate, archive...)
+            # đều dùng cùng một path — tránh tạo thư mục trùng lặp.
+            user_info = self.user_info or {}
+            user_id: str = str(user_info.get("user_id") or "")
+            self._ks_name: str = str(user_info.get("username") or user_id)
+            if not self._ks_name:
+                print_error("Không xác định được keystore name. Hủy đăng nhập.")
+                self.session_id = None
+                self.user_info = None
+                self._keystore_passphrase = None
+                return
             try:
-                identity_priv, identity_v, created_new = self._load_or_create_identity_key(user_id, self._keystore_passphrase)
+                identity_priv, identity_v, created_new = self._load_or_create_identity_key(self._ks_name, self._keystore_passphrase)
             except Exception as e:
                 print_error(f"Không thể mở/tạo identity key trong client keystore: {e}")
                 self.session_id = None
@@ -819,6 +807,8 @@ class IAMDemoClient:
 
     def show_main_menu(self):
         while self.session_id and self._running:
+            if not self.user_info:
+                break
             role_str = ", ".join(self.user_info.get("roles", []))
             username = self.user_info.get('username')
             
@@ -908,15 +898,22 @@ class IAMDemoClient:
             print_success(f"Khóa '{name}' ({algo}) đã được sinh thành công! (ID: {key_id})")
             
             private_pem = res.get("private_key_pem")
-            if private_pem:
+            public_pem  = res.get("public_key_pem")
+            if private_pem or public_pem:
                 try:
                     os.makedirs("data", exist_ok=True)
-                    file_path = f"data/{name}_private.pem"
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(private_pem)
-                    print_success(f"Đã lưu Private Key thành công tại: {file_path}")
+                    if private_pem:
+                        priv_path = f"data/{name}_private.pem"
+                        with open(priv_path, "w", encoding="utf-8") as f:
+                            f.write(private_pem)
+                        print_success(f"Đã lưu Private Key tại: {priv_path}")
+                    if public_pem:
+                        pub_path = f"data/{name}_public.pem"
+                        with open(pub_path, "w", encoding="utf-8") as f:
+                            f.write(public_pem)
+                        print_success(f"Đã lưu Public Key  tại: {pub_path}")
                 except Exception as e:
-                    print_error(f"Không thể lưu Private Key ra file: {e}\nNội dung PEM:\n{private_pem}")
+                    print_error(f"Không thể lưu key ra file: {e}")
 
     def do_key_list(self):
         print_header("Danh sách KHÓA")
@@ -997,10 +994,9 @@ class IAMDemoClient:
                                 if not self.user_info or not self._keystore_passphrase:
                                     raise ValueError("Thiếu user_info hoặc passphrase để rotate key")
 
-                                uid = self.user_info.get("user_id")
                                 self.current_crls = crls_updated
 
-                                new_priv, new_v = self._rotate_identity_key(uid, self._keystore_passphrase)
+                                new_priv, new_v = self._rotate_identity_key(self._ks_name, self._keystore_passphrase)
                                 self.private_key = new_priv
                                 self.public_key = self.private_key.public_key()
 
@@ -1046,10 +1042,13 @@ class IAMDemoClient:
         print_header("Danh bạ Chat E2E")
         res = self._sync_request({"type": "chat_directory"}, "chat_directory_response")
         if res:
-            for u in res.get("users", []):
-                status = f"{Colors.OKGREEN}Online{Colors.ENDC}" if u['online'] else "Offline"
+            online_users = [u for u in res.get("users", []) if u['online']]
+            if not online_users:
+                print("  (Không có ai đang online)")
+                return
+            for u in online_users:
                 cert_status = "Có" if u['has_cert'] else "Không"
-                print(f" • {u['username']} (ID: {u['user_id']}) | Trạng thái: {status} | Đã ĐK Cert: {cert_status}")
+                print(f" • {u['username']} (ID: {u['user_id']}) | Đã ĐK Cert: {cert_status}")
 
     def do_chat_e2e(self):
         print_header("Chế độ Chat Mã hóa E2E (Peer-to-peer)")
@@ -1091,14 +1090,35 @@ class IAMDemoClient:
                 self._reset_chat_state()
                 return
             
-            # Extract session key
-            session_key_b64 = res.get("session_key")
-            if not session_key_b64:
-                print_error("Session key không hợp lệ")
+            # Decrypt ticket_for_b bằng private key của Bob — server không biết Ks
+            ticket_for_b = res.get("ticket_for_b")
+            if not ticket_for_b:
+                print_error("Ticket từ KDC không hợp lệ")
                 self._reset_chat_state()
                 return
-            
-            self.chat_session_key = base64.b64decode(session_key_b64)
+
+            try:
+                oaep = asym_padding.OAEP(
+                    mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None,
+                )
+                ticket_data = json.loads(
+                    self.private_key.decrypt(base64.b64decode(ticket_for_b), oaep)
+                )
+                self.chat_session_key = base64.b64decode(ticket_data["ks"])
+                ttl_b = int(ticket_data.get("ttl") or 300)
+                issued_at_str = ticket_data.get("issued_at")
+                if issued_at_str:
+                    issued_at_dt = datetime.fromisoformat(issued_at_str.replace("Z", "")).replace(tzinfo=timezone.utc)
+                    self.chat_session_expires_at = issued_at_dt + timedelta(seconds=ttl_b)
+                else:
+                    self.chat_session_expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_b)
+            except Exception as e:
+                print_error(f"Không giải mã được ticket: {e}")
+                self._reset_chat_state()
+                return
+
             print_success("✅ Nhận session key từ KDC. Sẵn sàng chat.")
             
             # Enter chat mode
@@ -1137,7 +1157,6 @@ class IAMDemoClient:
             "relay_type": "chat_invite_kdc",
             "target_id": target_uid,
             "ticket": self.pending_ticket,
-            "ticket_nonce": self.pending_ticket_nonce,
             "ticket_id": self.pending_ticket_id,
         })
         
@@ -1369,13 +1388,23 @@ class IAMDemoClient:
         session_key = self.chat_session_key
         if session_key is None:
             return
+        expires_at = self.chat_session_expires_at
+        if expires_at:
+            remaining = (expires_at - datetime.now(timezone.utc)).seconds
+            print(f"{Colors.WARNING}[KDC] Session key hết hạn sau {remaining}s. Kết nối sẽ tự ngắt.{Colors.ENDC}")
         try:
             while True:
+                if expires_at and datetime.now(timezone.utc) >= expires_at:
+                    print(f"\n{Colors.FAIL}[KDC] Session key đã hết hạn. Kết nối bị ngắt.{Colors.ENDC}")
+                    break
                 msg = input("")
                 if msg.strip().lower() == "back":
                     break
                 if not msg.strip():
                     continue
+                if expires_at and datetime.now(timezone.utc) >= expires_at:
+                    print(f"\n{Colors.FAIL}[KDC] Session key hết hạn trong khi nhập. Tin nhắn không được gửi.{Colors.ENDC}")
+                    break
 
                 # associated_data ràng buộc cả sender lẫn receiver
                 assoc_data = f"{my_id}:{self.chat_peer_id}"
@@ -1402,7 +1431,10 @@ class IAMDemoClient:
         self.in_chat_mode = False
         self.chat_peer_id = None
         self.chat_session_key = None
+        self.chat_session_expires_at = None
         self.chat_peer_public_key = None
+        self.pending_ticket = None
+        self.pending_ticket_id = None
 
     def request_session_key_via_kdc(self, peer_id: str, ttl: int = 300) -> bool:
         """Request a session key from KDC for communication with peer_id.
@@ -1439,24 +1471,35 @@ class IAMDemoClient:
                 print_error(f"KDC response failed: {res.get('error') if res else 'timeout'}")
                 return False
             
-            # Extract response (plaintext session_key + encrypted ticket)
-            session_key_b64 = res.get('session_key')
-            ticket_enc = res.get('ticket')
-            ticket_nonce = res.get('ticket_nonce')
+            # Extract RSA-encrypted response
+            enc_ks = res.get('enc_ks')
+            ticket_for_b = res.get('ticket_for_b')
             ticket_id = res.get('ticket_id')
             ttl_resp = res.get('ttl')
-            
-            if not all([session_key_b64, ticket_enc, ticket_nonce, ticket_id]):
+
+            if not enc_ks or not ticket_for_b or not ticket_id:
                 print_error("Incomplete KDC response")
                 return False
-            
-            # Decode session key (plaintext from server)
-            self.chat_session_key = base64.b64decode(session_key_b64)
-            self.pending_ticket = ticket_enc
-            self.pending_ticket_nonce = ticket_nonce
+
+            # Decrypt Ks with local private key — server never sees Ks in plaintext
+            oaep = asym_padding.OAEP(
+                mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            )
+            ks = self.private_key.decrypt(base64.b64decode(enc_ks), oaep)
+            self.chat_session_key = ks
+            self.pending_ticket = ticket_for_b   # RSA-OAEP(PubB, {Ks,ida,ttl,issued_at}) — forward cho Bob
             self.pending_ticket_id = ticket_id
             self.chat_peer_id = peer_id
-            
+            if ttl_resp:
+                issued_at_str = res.get("issued_at")
+                if issued_at_str:
+                    issued_at_dt = datetime.fromisoformat(issued_at_str.replace("Z", "")).replace(tzinfo=timezone.utc)
+                    self.chat_session_expires_at = issued_at_dt + timedelta(seconds=int(ttl_resp))
+                else:
+                    self.chat_session_expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(ttl_resp))
+
             print_success(f"✅ Nhận session key từ KDC (TTL: {ttl_resp}s)")
             return True
             

@@ -5,7 +5,8 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, TYPE_CHECKING
 
-from .secure_transmission import encrypt_json_with_key, decrypt_json_with_key
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from cryptography.hazmat.primitives import hashes
 
 if TYPE_CHECKING:
     from .storage_backend import KdcTicketStorage
@@ -18,9 +19,10 @@ class KDC:
     only when no storage is provided and DB is unreachable).
     """
 
-    def __init__(self, key_store, data_dir: str = "data",
+    def __init__(self, key_store, pki=None, data_dir: str = "data",
                  ticket_storage: Optional['KdcTicketStorage'] = None):
         self.key_store = key_store
+        self.pki = pki
         self.data_dir = data_dir
         os.makedirs(self.data_dir, exist_ok=True)
 
@@ -139,45 +141,66 @@ class KDC:
 
     # ---- public API ----
 
-    def issue_session_ticket(self, ida: str, idb: str, requested_ttl: int = 300) -> Optional[Dict[str, str]]:
-        """Issue a session key Ks for ida <-> idb and return response envelope encrypted for A."""
-        try:
-            ka = self.key_store.get_entity_master_key(ida)
-            kb = self.key_store.get_entity_master_key(idb)
-        except Exception:
+    def issue_session_ticket(self, ida: str, idb: str, requested_ttl: int = 300) -> Optional[Dict[str, Any]]:
+        """Issue session key Ks for ida <-> idb using RSA public keys from PKI certificates.
+
+        Returns dict with:
+          enc_ks_for_a  — RSA-OAEP(PubA, Ks)       Alice decrypts with PrivA
+          ticket_for_b  — RSA-OAEP(PubB, {Ks,ida,ttl})  Bob decrypts with PrivB
+          ticket_id, ttl, issued_at
+        """
+        if not self.pki:
+            print("[KDC] PKI not configured — cannot issue session ticket")
             return None
+
+        try:
+            cert_a = self.pki.lookup(ida)
+            cert_b = self.pki.lookup(idb)
+        except Exception as e:
+            print(f"[KDC] PKI lookup failed: {e}")
+            return None
+
+        if not cert_a or not cert_b:
+            print(f"[KDC] Certificate not found for {'ida' if not cert_a else 'idb'}")
+            return None
+
+        # Reject expired certificates
+        now = datetime.utcnow()
+        try:
+            exp_a = cert_a.not_valid_after_utc.replace(tzinfo=None)
+            exp_b = cert_b.not_valid_after_utc.replace(tzinfo=None)
+        except AttributeError:
+            exp_a = cert_a.not_valid_after
+            exp_b = cert_b.not_valid_after
+        if now > exp_a or now > exp_b:
+            print("[KDC] One or both certificates are expired")
+            return None
+
+        pub_a = cert_a.public_key()
+        pub_b = cert_b.public_key()
 
         ks = os.urandom(32)
         ks_b64 = base64.b64encode(ks).decode('utf-8')
-
         ticket_id = secrets.token_hex(16)
         ttl = min(int(requested_ttl), 3600)
         issued_at = datetime.utcnow().isoformat() + "Z"
         expires_at = (datetime.utcnow() + timedelta(seconds=ttl)).isoformat() + "Z"
 
-        ticket_payload = {
-            "ticket_id": ticket_id,
-            "ks": ks_b64,
-            "ida": ida,
-            "ttl": ttl,
-            "issued_at": issued_at,
-        }
+        oaep = asym_padding.OAEP(
+            mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        )
 
-        ticket_blob = encrypt_json_with_key(kb, ticket_payload)
+        # enc_ks_for_a = RSA-OAEP(PubA, Ks) — only Alice can decrypt with PrivA
+        enc_ks_for_a = base64.b64encode(pub_a.encrypt(ks, oaep)).decode('utf-8')
 
-        response_for_a = {
-            "ks": ks_b64,
-            "ticket": ticket_blob["enc"],
-            "ticket_nonce": ticket_blob["nonce"],
-            "ticket_id": ticket_id,
-            "ttl": ttl,
-            "issued_at": issued_at,
-        }
-
-        envelope_for_a = encrypt_json_with_key(ka, response_for_a)
+        # ticket_for_b = RSA-OAEP(PubB, {Ks, ida, ttl, issued_at}) — only Bob can decrypt with PrivB
+        ticket_payload = json.dumps({"ks": ks_b64, "ida": ida, "ttl": ttl, "issued_at": issued_at}).encode('utf-8')
+        ticket_for_b = base64.b64encode(pub_b.encrypt(ticket_payload, oaep)).decode('utf-8')
 
         self.tickets[ticket_id] = {
-            "ks": ks_b64,
+            "ticket_for_b": ticket_for_b,
             "ida": ida,
             "idb": idb,
             "issued_at": issued_at,
@@ -186,7 +209,13 @@ class KDC:
         }
         self._save_ticket(ticket_id)
 
-        return envelope_for_a
+        return {
+            "enc_ks_for_a": enc_ks_for_a,
+            "ticket_for_b": ticket_for_b,
+            "ticket_id": ticket_id,
+            "ttl": ttl,
+            "issued_at": issued_at,
+        }
 
     def validate_ticket(self, ticket_id: str) -> bool:
         rec = self.tickets.get(ticket_id)
@@ -215,16 +244,3 @@ class KDC:
     def get_ticket_record(self, ticket_id: str) -> Optional[Dict[str, Any]]:
         return self.tickets.get(ticket_id)
 
-    def decrypt_keyreq(self, ida: str, enc_b64: str, nonce_b64: str) -> Optional[Dict[str, Any]]:
-        try:
-            ka = self.key_store.get_entity_master_key(ida)
-            return decrypt_json_with_key(ka, enc_b64, nonce_b64)
-        except Exception:
-            return None
-
-    def decrypt_ticket_for_b(self, idb: str, ticket_enc_b64: str, ticket_nonce_b64: str) -> Optional[Dict[str, Any]]:
-        try:
-            kb = self.key_store.get_entity_master_key(idb)
-            return decrypt_json_with_key(kb, ticket_enc_b64, ticket_nonce_b64)
-        except Exception:
-            return None

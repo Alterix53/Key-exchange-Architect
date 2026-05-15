@@ -100,12 +100,11 @@ class KeyStore:
     
     def generate_asymmetric_key_pair(self, key_id: str, owner: str, purpose: str,
                                     key_size: int = 2048,
-                                    private_key_password: Optional[str] = None,
-                                    export_dir: str = "user_keys") -> Tuple[str, str, str]:
+                                    private_key_password: Optional[str] = None) -> Tuple[str, str, str]:
         """Sinh cặp khóa RSA.
 
-        Private key KHÔNG lưu vào DB — được export ra file PEM để trao cho người dùng
-        (user là người duy nhất nắm private key của mình).
+        Private key KHÔNG lưu vào DB và KHÔNG lưu disk — trả về PEM string để
+        caller gửi trực tiếp về phía user (user là người duy nhất nắm private key).
         Public key được lưu vào SQL với purpose đã chỉ định.
         """
         private_key = rsa.generate_private_key(
@@ -143,14 +142,7 @@ class KeyStore:
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
 
-        # Export private key ra file — không lưu vào DB
-        os.makedirs(export_dir, exist_ok=True)
-        private_key_path = os.path.join(export_dir, f"{key_id}_private.pem")
-        with open(private_key_path, 'wb') as f:
-            f.write(private_pem)
-        print(f"[KeyStore] ✓ Private key exported to {private_key_path} (not stored in DB)")
-
-        # Chỉ lưu public key + metadata vào DB
+        # Chỉ lưu public key + metadata vào DB — private key trả về caller, không lưu disk
         self._save_public_key(key_id, public_pem)
         self.storage.save_metadata(key_id, metadata.to_dict())
 
@@ -398,11 +390,10 @@ class KeyStore:
             self.keys_metadata[key_id] = metadata
     
     def list_keys(self, owner: Optional[str] = None) -> list:
-        """Liệt kê các khóa"""
+        """Liệt kê các khóa — luôn truy vấn thẳng từ DB, không dùng cache."""
         keys = []
         for key_id in self.storage.list_key_ids():
-            if key_id not in self.keys_metadata:
-                self._load_metadata(key_id)
+            self._load_metadata(key_id)  # luôn reload từ DB
 
             metadata = self.keys_metadata.get(key_id)
             if metadata is None:

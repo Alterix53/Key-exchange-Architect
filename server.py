@@ -91,11 +91,6 @@ class IAMBackendServer:
         )
         self.audit_logger = AuditLogger("demo_audit")
 
-        # Initialize server keys storage (file-based, not in database)
-        self.server_keys_dir = "pki/server_keys"
-        os.makedirs(self.server_keys_dir, exist_ok=True)
-        self._load_or_create_server_keys()
-
         # liên kết với Hệ thống PKI nhằm xin chứng chỉ
         # Nếu thất bại kết nối PKI -> không có chứng chỉ
         # -> không thể thực hiện Mutual Auth → tất cả các API yêu cầu auth sẽ thất bại (demo lỗi PKI)
@@ -176,6 +171,7 @@ class IAMBackendServer:
             if hasattr(self, 'key_store') and self.key_store is not None:
                 self.kdc = KDC(
                     self.key_store,
+                    pki=self.pki,
                     ticket_storage=self._kdc_ticket_storage,
                 )
             else:
@@ -184,50 +180,6 @@ class IAMBackendServer:
             self.kdc = None
 
     # ------------- [CORE: SESSIONS & AUTH] -------------
-
-    def _load_or_create_server_keys(self) -> None:
-        """Load or create server's symmetric key for secure communication (file-based storage)"""
-        server_key_path = os.path.join(self.server_keys_dir, "server_symmetric_key.json")
-        
-        if os.path.exists(server_key_path):
-            try:
-                with open(server_key_path, "r") as f:
-                    key_data = json.load(f)
-                self.server_key_id = key_data.get("key_id")
-                self.server_key = base64.b64decode(key_data.get("key"))
-                print(f"[INIT] Loaded server symmetric key: {self.server_key_id}")
-            except Exception as e:
-                print(f"[INIT] Warning: Failed to load server key: {e}")
-                self._generate_new_server_key(server_key_path)
-        else:
-            self._generate_new_server_key(server_key_path)
-    
-    def _generate_new_server_key(self, server_key_path: str) -> None:
-        """Generate new server symmetric key and save to file"""
-        try:
-            self.server_key_id = f"server_symmetric_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            self.server_key = os.urandom(32)  # 256-bit AES key
-            
-            key_data = {
-                "key_id": self.server_key_id,
-                "algorithm": "AES-256",
-                "key": base64.b64encode(self.server_key).decode("utf-8"),
-                "created_at": datetime.now().isoformat(),
-                "purpose": "server_symmetric_communication"
-            }
-            
-            os.makedirs(os.path.dirname(server_key_path), exist_ok=True)
-            with open(server_key_path, "w") as f:
-                json.dump(key_data, f, indent=2)
-            
-            # Set file permissions to restrict access (Unix-like systems)
-            if os.name != 'nt':
-                os.chmod(server_key_path, 0o600)
-            
-            print(f"[INIT] Generated new server symmetric key: {self.server_key_id}")
-        except Exception as e:
-            print(f"[INIT] Error: Failed to generate server key: {e}")
-            raise
 
     def _require_auth(self, req: Dict, conn: ClientConnection) -> Optional[str]:
         """Validate session, return user_id if valid, else None"""
@@ -320,26 +272,17 @@ class IAMBackendServer:
             self.audit_logger.log_event(AuditEventType.USER_LOGIN, session.user_id, "backend", "login", "success", ip_address=ip)
             user_info = self.iam.users[session.user_id].to_dict()
             with self.clients_lock:
+                # Remove stale active_users entries pointing to this connection
+                # (happens when a client re-logs in as a different user on the same socket)
+                stale = [uid for uid, c in self.active_users.items() if c is conn and uid != session.user_id]
+                for uid in stale:
+                    del self.active_users[uid]
                 conn.session_id = session.session_id
                 conn.user_id = session.user_id
                 self.active_users[session.user_id] = conn
 
             self._notify_peer_joined(session.user_id)
             
-            # Initialize entity master key for KDC if not exists
-            if self.kdc:
-                try:
-                    # Check if entity master key exists by trying to get it
-                    existing_key = self.key_store.get_entity_master_key(session.user_id)
-                    if existing_key is None:
-                        # Create entity master key on first login
-                        self.kdc.create_entity_master_key(session.user_id)
-                        self.audit_logger.log_event(AuditEventType.KEY_GENERATED, session.user_id, "kdc", "entity_master_key", "success")
-                except Exception as e:
-                    # Log but don't fail login if key creation fails
-                    print(f"[KDC] Warning: Could not initialize entity master key for {session.user_id}: {e}")
-                    self.audit_logger.log_event(AuditEventType.KEY_GENERATED, session.user_id, "kdc", "entity_master_key", "failed", details={"error": str(e)})
-
             server_auth_proof = self.channel.sign_message(
                 f"{session.session_id}|{client_nonce}|login_ok",
                 self.server_private_key
@@ -359,16 +302,16 @@ class IAMBackendServer:
 
     def handle_register(self, req: Dict, conn: ClientConnection, ip: str) -> None:
         """Xử lý đăng ký tài khoản"""
-        username = req.get("username")
-        password = req.get("password")
-        email = req.get("email")
-        
-        if not all([username, password, email]):
+        username: str = req.get("username") or ""
+        password: str = req.get("password") or ""
+        email: str = req.get("email") or ""
+
+        if not username or not password or not email:
             conn.send({"type": "error", "message": "Thiếu thông tin đăng ký"})
             return
-            
+
         try:
-            # Kiểm tra trùng username
+            # Kiểm tra trùng username trong RAM (load từ DB lúc server khởi động)
             users_dict = {u.username: u for u in self.iam.users.values()}
             if username in users_dict:
                 conn.send({"type": "error", "message": "Tên đăng nhập đã tồn tại"})
@@ -508,11 +451,21 @@ class IAMBackendServer:
                 details={"serial_number": format(cert.serial_number, "x"), "reason": "User requested revocation"}
             )
 
-            # Sinh cặp khóa RSA mới cho user — private key trả về user, public key lưu DB
+            # Xóa tất cả public key cũ của user khỏi SQL trước khi tạo mới
             new_private_key_pem = None
             new_key_id = None
             if self.key_store is not None:
                 try:
+                    old_keys = self.key_store.list_keys(owner=user_id)
+                    for old_key in old_keys:
+                        old_kid = old_key.get("key_id")
+                        if old_kid:
+                            try:
+                                self.key_store.revoke_key(old_kid)
+                                print(f"[Server] ✓ Đã revoke key cũ khỏi SQL: {old_kid}")
+                            except Exception as e_rev:
+                                print(f"[Server] ⚠ Không thể revoke key cũ {old_kid}: {e_rev}")
+
                     new_key_id = f"user_{user_id}_key_{int(datetime.now().timestamp())}"
                     new_key_id, _, new_private_key_pem = self.key_store.generate_asymmetric_key_pair(
                         key_id=new_key_id,
@@ -668,13 +621,17 @@ class IAMBackendServer:
             self.audit_logger.log_event(AuditEventType.KEY_GENERATED, user_id, "backend", "key_gen", "success", details={"key_id": k_id, "algo": algorithm})
             
             res_payload = {
-                "type": "key_gen_ok", 
-                "key_id": k_id, 
+                "type": "key_gen_ok",
+                "key_id": k_id,
                 "message": "Đã sinh khóa thành công"
             }
             if private_key_pem:
                 res_payload["private_key_pem"] = private_key_pem
-                
+                # Đính kèm cả public key để client lưu file
+                pub_bytes = self.key_store.storage.load_public_key_bytes(k_id)
+                if pub_bytes:
+                    res_payload["public_key_pem"] = pub_bytes.decode("utf-8")
+
             conn.send(res_payload)
         except Exception as e:
             conn.send({"type": "error", "message": str(e)})
@@ -689,19 +646,21 @@ class IAMBackendServer:
             conn.send({"type": "error", "message": "KDC not initialized on server"})
             return
         
-        peer_id = req.get("peer_id")
+        peer_ref = req.get("peer_id")
         requested_ttl = req.get("requested_ttl", 300)
-        
-        if not peer_id:
+
+        if not peer_ref:
             conn.send({"type": "error", "message": "Missing peer_id"})
             return
-        
+
+        # Resolve username hoặc user_id → canonical user_id
+        peer_id = self._resolve_target_user_id(peer_ref)
+
         try:
-            # Validate peer exists
-            if peer_id not in self.iam.users:
-                conn.send({"type": "error", "message": f"Peer '{peer_id}' not found"})
-                self.audit_logger.log_event(AuditEventType.FAILED_LOGIN, user_id, "kdc", "keyreq", "failed", 
-                                          details={"reason": "peer_not_found", "peer": peer_id})
+            if not peer_id:
+                conn.send({"type": "error", "message": f"Peer '{peer_ref}' not found"})
+                self.audit_logger.log_event(AuditEventType.FAILED_LOGIN, user_id, "kdc", "keyreq", "failed",
+                                          details={"reason": "peer_not_found", "peer": peer_ref})
                 return
             
             # Issue session ticket + key
@@ -713,15 +672,13 @@ class IAMBackendServer:
                                           details={"reason": "ticket_issue_failed"})
                 return
             
-            # Send plaintext response (connection is authenticated via X.509)
             conn.send({
                 "type": "kdc_keyresp",
-                "session_key": response.get("ks"),           # Plaintext session key
-                "ticket": response.get("ticket"),             # Encrypted ticket (for Bob)
-                "ticket_nonce": response.get("ticket_nonce"),
+                "enc_ks": response.get("enc_ks_for_a"),      # RSA-OAEP(PubA, Ks) — Alice giải mã bằng PrivA
+                "ticket_for_b": response.get("ticket_for_b"), # RSA-OAEP(PubB, {Ks,ida,ttl}) — chuyển cho Bob
                 "ticket_id": response.get("ticket_id"),
                 "ttl": response.get("ttl"),
-                "issued_at": response.get("issued_at")
+                "issued_at": response.get("issued_at"),
             })
             
             self.audit_logger.log_event(AuditEventType.MESSAGE_RECEIVED, user_id, "kdc", "keyreq", "success", 
@@ -925,20 +882,19 @@ class IAMBackendServer:
                 conn.send({"type": "error", "message": "Ticket not found"})
                 return
             
-            # Extract session key from ticket
-            ks_b64 = ticket_rec.get("ks")
+            # Forward RSA-encrypted ticket to Bob — Bob decrypts with his own PrivB
+            ticket_for_b = ticket_rec.get("ticket_for_b")
             ida = ticket_rec.get("ida")
-            
-            if not ks_b64:
-                conn.send({"type": "error", "message": "Cannot extract session key from ticket"})
+
+            if not ticket_for_b:
+                conn.send({"type": "error", "message": "Ticket record missing encrypted payload"})
                 return
-            
-            # Send plaintext session key to Bob
+
             conn.send({
                 "type": "kdc_session_key",
-                "session_key": ks_b64,
+                "ticket_for_b": ticket_for_b,   # RSA-OAEP(PubB, {Ks,ida,ttl}) — server không biết Ks
                 "sender_id": ida,
-                "ticket_id": ticket_id
+                "ticket_id": ticket_id,
             })
             
             # Notify Alice that Bob accepted

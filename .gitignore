@@ -1,3 +1,4 @@
+.env
 demo_audit/
 demo_encryption/
 demo_key_rotation/
@@ -13,3 +14,4 @@ Architect.pdf
 data/
 src/db/__pycache__/
 pki/
+__pycache__/
